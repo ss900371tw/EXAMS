@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+opencv-python-headless
+pdfplumber
+Pillow
+pdf2image
+google-cloud-vision
+google-genai
+pydantic
