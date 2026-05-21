@@ -50,17 +50,14 @@ def enhance_for_ocr(img_np):
     return denoised
 
 
-def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_debug=False, external_boxes=None):
+def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_debug=False):
     """
     結合 OpenCV 定位與 pdfplumber/Google Vision 的混合文字提取。
     優先順序：pdfplumber 區域提取 > Google Vision OCR。
-    
-    支援 external_boxes：若傳入外部 Bounding Boxes 結構，則跳過框線偵測，直接沿用座標。
     """
     images = convert_from_bytes(pdf_bytes, dpi=350)
     all_text_results = []
     debug_images = []
-    all_page_candidates = [] # 用來記錄每一頁的 Box 資訊
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for p_idx, img in enumerate(images):
@@ -73,48 +70,39 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
             scale_x = w_pdf / w_img
             scale_y = h_pdf / h_img
 
-            # 💡 核心改動：如果外部有提供對齊用的 Box 座標，直接借用
-            if external_boxes is not None and p_idx < len(external_boxes):
-                candidates = external_boxes[p_idx]
-            else:
-                # 執行原本的 OpenCV 框線偵測邏輯
-                gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-                blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-                binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                               cv2.THRESH_BINARY_INV, 21, 18)
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                           cv2.THRESH_BINARY_INV, 21, 18)
 
-                h_k = max(60, int(min_w * 0.5)) 
-                v_k = max(30, int(min_h * 0.6))
-                horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_k, 1))
-                vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_k))
+            h_k = max(60, int(min_w * 0.5)) 
+            v_k = max(30, int(min_h * 0.6))
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_k, 1))
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_k))
+            
+            detected_h = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+            detected_v = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+            detected_lines = cv2.add(detected_h, detected_v)
+
+            contours, _ = cv2.findContours(detected_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            candidates = []
+            for cnt in contours:
+                rect = cv2.minAreaRect(cnt)
+                (cx, cy), (w, h), angle = rect
+                if w < h:
+                    w, h = h, w
+                    angle += 90
                 
-                detected_h = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-                detected_v = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
-                detected_lines = cv2.add(detected_h, detected_v)
-
-                contours, _ = cv2.findContours(detected_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if abs(angle) < 5 or abs(angle - 180) < 5: angle = 0
                 
-                candidates = []
-                for cnt in contours:
-                    rect = cv2.minAreaRect(cnt)
-                    (cx, cy), (w, h), angle = rect
-                    if w < h:
-                        w, h = h, w
-                        angle += 90
-                    
-                    if abs(angle) < 5 or abs(angle - 180) < 5: angle = 0
-                    
-                    if w >= min_w and h >= min_h:
-                        box = cv2.boxPoints(((cx, cy), (w, h), angle))
-                        box = np.int0(box)
-                        candidates.append(((cx, cy), (w, h), angle, box))
+                if w >= min_w and h >= min_h:
+                    box = cv2.boxPoints(((cx, cy), (w, h), angle))
+                    box = np.int0(box)
+                    candidates.append(((cx, cy), (w, h), angle, box))
 
-                candidates = sorted(candidates, key=lambda x: x[0][1])
+            candidates = sorted(candidates, key=lambda x: x[0][1])
 
-            # 儲存這一頁最終使用的 candidates 座標，供後續回傳
-            all_page_candidates.append(candidates)
-
-            # 開始依據座標切圖與提取文字
             for (cx, cy), (w, h), angle, box_points in candidates:
                 x_min, y_min = np.min(box_points, axis=0)
                 x_max, y_max = np.max(box_points, axis=0)
@@ -167,7 +155,7 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
             if need_debug:
                 debug_images.append(Image.fromarray(img_np))
 
-    return all_text_results, debug_images, all_page_candidates
+    return all_text_results, debug_images
 
 # --- 2. Streamlit UI ---
 
@@ -177,11 +165,18 @@ def main():
     st.set_page_config(page_title="AI 評分系統", layout="wide")
     st.title("📑 全自動考卷批改工作台 (Gemini Pro 強化版)")
 
+    # 💡 加上這段：初始化 debug_images 變數
     if "debug_images" not in st.session_state:
-        st.session_state.debug_images = []
+        st.session_state.debug_images = []  # 給它一個空的列表作為初始值
 
+    # API 憑證與客戶端初始化
+    
+    # 建議在環境變數或 Streamlit secrets 中設定 GEMINI_API_KEY
+    
     try:
         vision_client = vision.ImageAnnotatorClient()
+        
+        # 初始化新版 Gemini Client (會自動讀取環境變數中的 GEMINI_API_KEY)
         gemini_client = Client() 
     except Exception as e:
         st.error(f"初始化 API 失敗，請檢查環境變數與憑證：{e}")
@@ -204,23 +199,10 @@ def main():
                 a_bytes = pdf_a.read()
                 p_bytes = pdf_p.read()
 
-                # 💡 調整回傳值接收：現在函式會多回傳一個 Box 座標清單
-                q_texts, _, _ = detect_and_ocr_boxes(q_bytes, vision_client)
-                a_texts, _, _ = detect_and_ocr_boxes(a_bytes, vision_client)
-                p_texts, _, p_boxes = detect_and_ocr_boxes(p_bytes, vision_client)
-                
-                # 嘗試正常偵測學生作答的 Box
-                s_texts, s_debug_imgs, s_boxes = detect_and_ocr_boxes(s_bytes, vision_client, need_debug=True)
-                
-                # 💡 核心對齊邏輯：計算學生 PDF 偵測到的總 Box 數量
-                total_s_boxes = sum(len(page_boxes) for page_boxes in s_boxes)
-                
-                # 如果學生 PDF 沒抓到半個 Box，自動套用配分 PDF 的座標重新提取
-                if total_s_boxes == 0:
-                    st.sidebar.info("🔍 偵測到學生作答未包含明晰框線，已啟動自動對齊：正在套用「配分 PDF」的區域座標進行強制 OCR...")
-                    s_texts, s_debug_imgs, _ = detect_and_ocr_boxes(
-                        s_bytes, vision_client, need_debug=True, external_boxes=p_boxes
-                    )
+                q_texts, _ = detect_and_ocr_boxes(q_bytes, vision_client)
+                s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, vision_client, need_debug=True)
+                a_texts, _ = detect_and_ocr_boxes(a_bytes, vision_client)
+                p_texts, _ = detect_and_ocr_boxes(p_bytes, vision_client)
                 
                 num_questions = max(len(q_texts), len(s_texts), len(a_texts), len(p_texts))
                 
@@ -279,17 +261,21 @@ def main():
                             f"該題最高分（配分）：{row['配分']}\n"
                         )
                         try:
+                            # 呼叫最新的 Gemini 2.5 Pro 模型
                             response = gemini_client.models.generate_content(
                                 model='gemini-2.5-pro',
                                 contents=prompt,
                                 config=types.GenerateContentConfig(
+                                    # 利用 Pydantic 強制要求結構化輸出，不需要再靠 RegExp 解析文字
                                     response_mime_type="application/json",
                                     response_schema=GradingResult,
-                                    temperature=0.2,
+                                    temperature=0.2, # 降低隨機性，讓評分更嚴謹客觀
                                 ),
                             )
                             
+                            # 透過 parsed 直接拿取物件屬性，安全又快速
                             result: GradingResult = response.parsed
+                            
                             st.session_state.df.at[index, "得分"] = result.score
                             st.session_state.df.at[index, "AI 評分理由"] = result.reason
                             
@@ -299,8 +285,7 @@ def main():
 
     with col2:
         st.subheader("🔍 框選對齊視覺檢查")
-        # 💡 修正原本判斷條件寫錯的 Bug (原本寫 debug_imgs 導致綠框預覽出不來)
-        if "debug_images" in st.session_state:
+        if "debug_imgs" in st.session_state:
             for i, img in enumerate(st.session_state.debug_images):
                 st.image(img, caption=f"偵測區域預覽 - 頁面 {i+1}")
 
