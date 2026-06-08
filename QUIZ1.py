@@ -53,11 +53,15 @@ def enhance_for_ocr(img_np):
 def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_debug=False):
     """
     結合 OpenCV 定位與 pdfplumber/Google Vision 的混合文字提取。
-    優先順序：pdfplumber 區域提取 > Google Vision OCR。
+    具備「跨頁表格文字連續性判定」機制。
     """
     images = convert_from_bytes(pdf_bytes, dpi=350)
     all_text_results = []
     debug_images = []
+
+    # 用來暫存每一頁解析出來的區塊資訊
+    # 結構: page_blocks[p_idx] = [ {"text": text, "bbox": (x0, y0, x1, y1)}, ... ]
+    page_blocks = {} 
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for p_idx, img in enumerate(images):
@@ -101,7 +105,9 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                     box = np.int0(box)
                     candidates.append(((cx, cy), (w, h), angle, box))
 
+            # 依 Y 軸由上到下排序
             candidates = sorted(candidates, key=lambda x: x[0][1])
+            page_blocks[p_idx] = []
 
             for (cx, cy), (w, h), angle, box_points in candidates:
                 x_min, y_min = np.min(box_points, axis=0)
@@ -138,7 +144,6 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                     buf = io.BytesIO()
                     cropped_img.save(buf, format="JPEG")
                     image_context = vision.ImageContext(language_hints=["zh-Hant", "en"])
-
                     vision_img = vision.Image(content=buf.getvalue())
 
                     response = vision_client.document_text_detection(
@@ -147,13 +152,62 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                     )
                     text = response.full_text_annotation.text.strip() if response.full_text_annotation.text else ""
 
-                all_text_results.append(text)
+                # 儲存文字與其在 PDF 中的位置 (pdf_bbox 格式為 x0, y0, x1, y1)
+                page_blocks[p_idx].append({
+                    "text": text,
+                    "bbox": pdf_bbox
+                })
                 
                 if need_debug:
                     cv2.drawContours(img_np, [box_points], 0, (0, 255, 0), 3)
 
             if need_debug:
                 debug_images.append(Image.fromarray(img_np))
+
+        # --- 跨頁表格合併核心邏輯 ---
+        total_pages = len(images)
+        for p_idx in range(total_pages):
+            # 如果不是第一頁，且上一頁有表格，這一頁也有表格
+            if p_idx > 0 and len(page_blocks[p_idx - 1]) > 0 and len(page_blocks[p_idx]) > 0:
+                
+                prev_page = pdf.pages[p_idx - 1]
+                curr_page = pdf.pages[p_idx]
+                
+                last_block_prev_page = page_blocks[p_idx - 1][-1]
+                first_block_curr_page = page_blocks[p_idx][0]
+                
+                # 1. 取得上一頁最後一個表格下方，到頁尾的區域
+                # cropped 範圍: 左=0, 上=最後表格的底(y1), 右=頁寬, 下=頁高
+                text_below_last_table = ""
+                try:
+                    bottom_crop = prev_page.crop((0, last_block_prev_page["bbox"][3], prev_page.width, prev_page.height))
+                    text_below_last_table = bottom_crop.extract_text() or ""
+                except Exception:
+                    pass
+                
+                # 2. 取得這一頁頁首，到第一個表格上方之間的區域
+                # cropped 範圍: 左=0, 上=0, 右=頁寬, 下=第一個表格的頂(y0)
+                text_above_first_table = ""
+                try:
+                    top_crop = curr_page.crop((0, 0, curr_page.width, first_block_curr_page["bbox"][0]))
+                    text_above_first_table = top_crop.extract_text() or ""
+                except Exception:
+                    pass
+                
+                # 3. 判定指標：這兩個夾縫區塊去除空白後，是否完全沒有文字
+                is_between_empty = (not text_below_last_table.strip()) and (not text_above_first_table.strip())
+                
+                if is_between_empty:
+                    # 符合指標：將這一頁第一個表格的文字，合併到上一頁最後一個表格
+                    last_block_prev_page["text"] += "\n" + first_block_curr_page["text"]
+                    # 標記這一頁第一個區塊已被合併（後續不單獨加入最終結果）
+                    first_block_curr_page["is_merged_child"] = True
+
+        # --- 重新打包成最終的文字列表 ---
+        for p_idx in range(total_pages):
+            for block in page_blocks[p_idx]:
+                if not block.get("is_merged_child", False):
+                    all_text_results.append(block["text"])
 
     return all_text_results, debug_images
 
