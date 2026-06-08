@@ -333,44 +333,54 @@ def main():
             st.markdown(f"### 🎯 目前總分：{current_score:.1f} / 100.0")
 
         # --- 執行 AI 批改邏輯 ---
+        # --- 執行 AI 批改邏輯 ---
         if run_ai:
-            with st.spinner("Gemini Pro 正在深入分析答案並評分中..."):
-                temp_df = st.session_state.df.copy()
+            temp_df = st.session_state.df.copy()
+            num_rows = len(temp_df)
+            
+            # 建立一個動態文字容器，用來顯示目前進度
+            status_text = st.empty()
+            
+            for index, row in temp_df.iterrows():
+                # 動態更新目前正在批改的題號
+                status_text.markdown(f"⏳ **Gemini Pro 正在批改第 {index + 1} / {num_rows} 題...**")
                 
-                for index, row in temp_df.iterrows():
-                    if row["學生作答"]:
-                        # 🛠️ 修正 Prompt：嚴格規範 Gemini 必須根據該題配分給分，這樣加總才會是符合 100 分制
-                        prompt = (
-                            f"你是一位專業老師。此考卷採取「總分 100 分制」，請根據以下單題資訊進行精確評分：\n"
-                            f"問題：{row['問題內容']}\n"
-                            f"標準答案：{row['標準答案']}\n"
-                            f"學生回答：{row['學生作答']}\n"
-                            f"【重要】此題的最高配分（滿分）為：{row['配分']} 分。\n"
-                            f"請評估學生的回答完整度與正確性，給予 0 到 {row['配分']} 之間的合理分數（可為小數）。\n"
-                            f"你給出的分數「絕對不可以」超過該題的最高配分。\n"
+                if row["學生作答"]:
+                    # 🛠️ 修正 Prompt：嚴格規範 Gemini 必須根據該題配分給分，這樣加總才會是符合 100 分制
+                    prompt = (
+                        f"你是一位專業老師。此考卷採取「總分 100 分制」，請根據以下單題資訊進行精確評分：\n"
+                        f"問題：{row['問題內容']}\n"
+                        f"標準答案：{row['標準答案']}\n"
+                        f"學生回答：{row['學生作答']}\n"
+                        f"【重要】此題的最高配分（滿分）為：{row['配分']} 分。\n"
+                        f"請評估學生的回答完整度與正確性，給予 0 到 {row['配分']} 之間的合理分數（可為小數）。\n"
+                        f"你給出的分數「絕對不可以」超過該題的最高配分。\n"
+                    )
+                    try:
+                        response = gemini_client.models.generate_content(
+                            model='gemini-2.5-pro',
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                response_schema=GradingResult,
+                                temperature=0.2, 
+                            ),
                         )
-                        try:
-                            response = gemini_client.models.generate_content(
-                                model='gemini-2.5-pro',
-                                contents=prompt,
-                                config=types.GenerateContentConfig(
-                                    response_mime_type="application/json",
-                                    response_schema=GradingResult,
-                                    temperature=0.2, 
-                                ),
-                            )
-                            
-                            result: GradingResult = response.parsed
-                            temp_df.at[index, "得分"] = float(result.score)
-                            temp_df.at[index, "AI 評分理由"] = result.reason
-                            
-                        except Exception as e:
-                            st.warning(f"第 {index+1} 題評分錯誤: {e}")
-                
-                st.session_state.df = temp_df
-                st.success("🎉 全數批改完成！")
-                st.rerun()
-
+                        
+                        result: GradingResult = response.parsed
+                        temp_df.at[index, "得分"] = float(result.score)
+                        temp_df.at[index, "AI 評分理由"] = result.reason
+                        
+                    except Exception as e:
+                        st.warning(f"第 {index+1} 題評分錯誤: {e}")
+            
+            # 批改完成後清除進度文字
+            status_text.empty()
+            
+            st.session_state.df = temp_df
+            st.success("🎉 全數批改完成！")
+            st.rerun()
+            
     with col2:
         st.subheader("🔍 框選對齊視覺檢查")
         if st.session_state.debug_images:
