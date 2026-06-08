@@ -1,35 +1,21 @@
 import streamlit as st
-
 import pandas as pd
-
 import numpy as np
-
 import cv2
-
 import io
-
 import os
-
 import re
-
 import pdfplumber
-
 from PIL import Image
-
 from pdf2image import convert_from_bytes
-
 from google.cloud import vision
-
 from google.api_core.client_options import ClientOptions
 
 
 
 # 1. 引入最新的 Gemini GenAI SDK
-
 from google.genai import Client
-
 from google.genai import types
-
 from pydantic import BaseModel, Field
 
 
