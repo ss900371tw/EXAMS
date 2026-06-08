@@ -494,150 +494,91 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
 
 # --- 2. Streamlit UI ---
 
-
-
 def main():
-
     st.set_page_config(page_title="AI 評分系統", layout="wide")
-
     st.title("📑 全自動考卷批改工作台 (Gemini Pro 強化版)")
 
-
-
     # 初始化 session_state
-
     if "debug_images" not in st.session_state:
-
         st.session_state.debug_images = []
-
     if "df" not in st.session_state:
-
         st.session_state.df = pd.DataFrame(columns=["題目", "問題內容", "學生作答", "標準答案", "配分", "得分", "AI 評分理由"])
 
-
-
     # --- API 客戶端初始化 ---
-
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
     
-
     if not GOOGLE_API_KEY:
-
         st.error("❌ 環境變數中找不到 GOOGLE_API_KEY，請確認 Streamlit Secrets 設定。")
-
         st.stop()
 
-
-
     try:
-
         options = ClientOptions(api_key=GOOGLE_API_KEY)
-
         vision_client = vision.ImageAnnotatorClient(client_options=options)
-
         gemini_client = Client() 
-
     except Exception as e:
-
         st.error(f"💥 初始化 API 失敗，請檢查環境變數與憑證：{e}")
-
         return
 
-
-
     with st.sidebar:
-
         st.header("📥 上傳 PDF 來源")
-
         pdf_q = st.file_uploader("1. 問題內容 PDF", type="pdf")
-
         pdf_s = st.file_uploader("2. 學生作答 PDF", type="pdf")
-
         pdf_a = st.file_uploader("3. 標準答案 PDF", type="pdf")
-
         pdf_p = st.file_uploader("4. 配分 PDF", type="pdf")
-
         
-
         if st.button("🚀 開始全自動解析") and pdf_q and pdf_s and pdf_a and pdf_p:
-
             with st.spinner("正在執行精準座標對齊與文字提取..."):
-
                 q_bytes = pdf_q.read()
-
                 s_bytes = pdf_s.read()
-
                 a_bytes = pdf_a.read()
-
                 p_bytes = pdf_p.read()
 
-
-
                 q_texts, _ = detect_and_ocr_boxes(q_bytes, vision_client)
-
                 s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, vision_client, need_debug=True)
-
                 a_texts, _ = detect_and_ocr_boxes(a_bytes, vision_client)
-
                 p_texts, _ = detect_and_ocr_boxes(p_bytes, vision_client)
-
                 
-
                 num_questions = max(len(q_texts), len(s_texts), len(a_texts), len(p_texts))
-
                 
-
                 data = []
-
                 for i in range(num_questions):
-
                     data.append({
-
                         "題目": f"第 {i+1} 題",
-
                         "問題內容": q_texts[i] if i < len(q_texts) else "",
-
                         "學生作答": s_texts[i] if i < len(s_texts) else "",
-
                         "標準答案": a_texts[i] if i < len(a_texts) else "",
-
                         "配分": p_texts[i] if i < len(p_texts) else "10",
-
                         "得分": 0.0,
-
                         "AI 評分理由": ""
-
                     })
-
                 
-
+                # 解析新檔案時，清除舊的 editor 狀態以防衝突
+                if "grading_editor" in st.session_state:
+                    del st.session_state["grading_editor"]
+                    
                 st.session_state.df = pd.DataFrame(data)
-
                 st.session_state.debug_images = s_debug_imgs
-
                 st.success(f"解析完成！共處理 {num_questions} 個題目區塊。")
 
-
-
     col1, col2 = st.columns([3, 2])
-
-
 
     with col1:
         st.subheader("📝 結構化評分表")
         
-        # 讓使用者可以手動調整或即時查看的編輯器
+        # 【修正點 1】引入關鍵的 key="grading_editor"，讓 Streamlit 追蹤此編輯器的狀態
+        # 這樣當使用者手動在表格上修改時，也會同步保留
         edited_df = st.data_editor(
             st.session_state.df,
             num_rows="dynamic",
             use_container_width=True,
-            height=600
+            height=600,
+            key="grading_editor"
         )
-        # 確保編輯器的任何變動立刻同步回 session_state
+        
+        # 同步回 session_state.df
         st.session_state.df = edited_df
 
-        # --- 核心修正：每次渲染時，先即時計算當前 df 內的配分與得分 ---
+        # 即時計算當前 df 內 的配分與得分
         try:
             total_possible = pd.to_numeric(st.session_state.df["配分"]).sum()
             current_score = pd.to_numeric(st.session_state.df["得分"]).sum()
@@ -652,63 +593,68 @@ def main():
             run_ai = st.button("🤖 執行 Gemini 自動批改", use_container_width=True)
         
         with score_col:
-            # 這裡會即時顯示加總成果
             st.markdown(f"### 🎯 目前得分：{current_score:.1f} / {total_possible:.1f}")
 
         # --- 執行 AI 批改邏輯 ---
         if run_ai:
-            with st.spinner("Gemini Pro 正在深入分析答案並評分中..."):
-                for index, row in st.session_state.df.iterrows():
-                    if row["學生作答"]:
-                        prompt = (
-                            f"你是一位專業老師。請根據以下資訊評分：\n"
-                            f"問題：{row['問題內容']}\n"
-                            f"標準答案：{row['標準答案']}\n"
-                            f"學生回答：{row['學生作答']}\n"
-                            f"該題最高分（配分）：{row['配分']}\n"
-                        )
-                        try:
-                            response = gemini_client.models.generate_content(
-                                model='gemini-2.5-pro',
-                                contents=prompt,
-                                config=types.GenerateContentConfig(
-                                    response_mime_type="application/json",
-                                    response_schema=GradingResult,
-                                    temperature=0.2, 
-                                ),
+            if st.session_state.df.empty:
+                st.warning("請先上傳 PDF 並解析出題目數據。")
+            else:
+                with st.spinner("Gemini Pro 正在深入分析答案並評分中..."):
+                    # 建立一個區域用來顯示動態進度
+                    progress_text = st.empty()
+                    
+                    for index, row in st.session_state.df.iterrows():
+                        if row["學生作答"]:
+                            progress_text.info(f"正在批改第 {index+1} 題...")
+                            prompt = (
+                                f"你是一位專業老師。請根據以下資訊評分：\n"
+                                f"問題：{row['問題內容']}\n"
+                                f"標準答案：{row['標準答案']}\n"
+                                f"學生回答：{row['學生作答']}\n"
+                                f"該題最高分（配分）：{row['配分']}\n"
                             )
-                            
-                            result: GradingResult = response.parsed
-                            
-                            # 寫入最新的得分與理由
-                            st.session_state.df.at[index, "得分"] = float(result.score)
-                            st.session_state.df.at[index, "AI 評分理由"] = result.reason
-                            
-                        except Exception as e:
-                            st.warning(f"第 {index+1} 題評分錯誤: {e}")
-                
-                st.success("🎉 全數批改完成！")
-                # 批改完成後強制全面刷新，讓最上方的 current_score 重新計算並完美顯示
-                st.rerun()
-
-
+                            try:
+                                response = gemini_client.models.generate_content(
+                                    model='gemini-2.5-pro',
+                                    contents=prompt,
+                                    config=types.GenerateContentConfig(
+                                        response_mime_type="application/json",
+                                        response_schema=GradingResult,
+                                        temperature=0.2, 
+                                    ),
+                                )
+                                
+                                result: GradingResult = response.parsed
+                                
+                                # 寫入最新的得分與理由
+                                st.session_state.df.at[index, "得分"] = float(result.score)
+                                st.session_state.df.at[index, "AI 評分理由"] = result.reason
+                                
+                            except Exception as e:
+                                st.warning(f"第 {index+1} 題評分錯誤: {e}")
+                    
+                    progress_text.empty()
+                    st.success("🎉 全數批改完成！")
+                    
+                    # 【修正點 2】強制將最新的 DataFrame 覆蓋回 data_editor 的內部 state
+                    # 這能確保 st.rerun() 重新渲染時，表格呈現的是最新的 AI 得分
+                    st.session_state["grading_editor"] = {
+                        "edited_rows": {}, 
+                        "added_rows": [], 
+                        "deleted_rows": []
+                    }
+                    
+                    # 批改完成後強制全面刷新，讓最上方的 current_score 重新計算並完美顯示
+                    st.rerun()
 
     with col2:
-
         st.subheader("🔍 框選對齊視覺檢查")
-
         if st.session_state.debug_images:
-
             for i, img in enumerate(st.session_state.debug_images):
-
                 st.image(img, caption=f"偵測區域預覽 - 頁面 {i+1}")
-
         else:
-
             st.info("暫無視覺檢查影像，請先上傳 PDF 並點擊開始全自動解析。")
 
-
-
 if __name__ == "__main__":
-
     main()
