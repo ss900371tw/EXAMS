@@ -8,3 +8,4 @@ pdf2image
 google-cloud-vision
 google-genai
 pydantic
+poppler-utils
