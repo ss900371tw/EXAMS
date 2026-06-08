@@ -283,9 +283,9 @@ def main():
         edited_df = st.data_editor(
             st.session_state.df,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",          # 新版改用 width="stretch" 撐滿寬度
             height=600
-        )
+            )
         st.session_state.df = edited_df
 
         try:
