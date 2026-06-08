@@ -51,21 +51,55 @@ def enhance_for_ocr(img_np):
     return denoised
 
 
+def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
+    """
+    針對掃描檔的盲區內容偵測：
+    透過二值化分析特定 Y 軸區間內是否存在非空白內容（文字或符號）。
+    - threshold_ratio: 黑色像素佔該區塊總面積的比例超過多少視為「有文字內容」
+    """
+    h, w, _ = img_np.shape
+    
+    # 安全範圍限縮，避免陣列越界
+    y_start = max(0, int(y_start))
+    y_end = min(h, int(y_end))
+    
+    # 如果裁剪區間過小，視為無阻隔文字
+    if (y_end - y_start) < 10:
+        return False
+        
+    crop_roi = img_np[y_start:y_end, 0:w]
+    gray = cv2.cvtColor(crop_roi, cv2.COLOR_RGB2GRAY)
+    
+    # 使用大津二值化將文字（深色）與背景（白色）分離
+    # 為了方便計算，轉為反轉二值化（文字變白色像素 255，背景變 0）
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # 計算非零像素（即文字內容）的比例
+    non_zero_count = cv2.countNonZero(binary)
+    total_pixels = binary.size
+    black_pixel_ratio = non_zero_count / total_pixels
+    
+    # 超過閾值代表中間夾有題目文字或線條，兩者不應合併
+    return black_pixel_ratio > threshold_ratio
+
+
 def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_debug=False):
     """
     結合 OpenCV 定位與 pdfplumber/Google Vision 的混合文字提取。
-    具備「跨頁表格文字連續性判定」機制。
+    具備「跨頁表格文字連續性判定」機制（支援掃描檔與非掃描檔）。
     """
     images = convert_from_bytes(pdf_bytes, dpi=350)
     all_text_results = []
     debug_images = []
 
-    # 用來暫存每一頁解析出來的區塊資訊
+    # 用來暫存每一頁解析出來的區塊資訊與原始影像
     page_blocks = {} 
+    page_cv_images = {} # 存放各頁的原始 ndarray 用於跨頁 OpenCV 檢測
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for p_idx, img in enumerate(images):
             img_np = np.array(img.convert("RGB"))
+            page_cv_images[p_idx] = img_np.copy() # 備份原始影像
             h_img, w_img, _ = img_np.shape
             
             page_plumber = pdf.pages[p_idx]
@@ -154,7 +188,8 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
 
                 page_blocks[p_idx].append({
                     "text": text,
-                    "bbox": pdf_bbox
+                    "bbox": pdf_bbox,
+                    "img_box": (x_min, y_min, x_max, y_max) # 保存原圖影像座標以利跨頁對比
                 })
                 
                 if need_debug:
@@ -163,34 +198,48 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
             if need_debug:
                 debug_images.append(Image.fromarray(img_np))
 
-        # --- 跨頁表格合併核心邏輯 ---
+        # --- 跨頁表格合併核心邏輯 (支援掃描檔雙重檢查) ---
         total_pages = len(images)
         for p_idx in range(total_pages):
             if p_idx > 0 and len(page_blocks[p_idx - 1]) > 0 and len(page_blocks[p_idx]) > 0:
                 
-                prev_page = pdf.pages[p_idx - 1]
-                curr_page = pdf.pages[p_idx]
+                prev_page_plumber = pdf.pages[p_idx - 1]
+                curr_page_plumber = pdf.pages[p_idx]
                 
                 last_block_prev_page = page_blocks[p_idx - 1][-1]
                 first_block_curr_page = page_blocks[p_idx][0]
                 
+                # --- 測試 1: 數位型 PDF 判定法 (pdfplumber 區域文字提取) ---
                 text_below_last_table = ""
-                try:
-                    bottom_crop = prev_page.crop((0, last_block_prev_page["bbox"][3], prev_page.width, prev_page.height))
-                    text_below_last_table = bottom_crop.extract_text() or ""
-                except Exception:
-                    pass
-                
                 text_above_first_table = ""
                 try:
-                    top_crop = curr_page.crop((0, 0, curr_page.width, first_block_curr_page["bbox"][0]))
+                    bottom_crop = prev_page_plumber.crop((0, last_block_prev_page["bbox"][3], prev_page_plumber.width, prev_page_plumber.height))
+                    text_below_last_table = bottom_crop.extract_text() or ""
+                    
+                    top_crop = curr_page_plumber.crop((0, 0, curr_page_plumber.width, first_block_curr_page["bbox"][0]))
                     text_above_first_table = top_crop.extract_text() or ""
                 except Exception:
                     pass
                 
-                is_between_empty = (not text_below_last_table.strip()) and (not text_above_first_table.strip())
+                has_digital_text_between = bool(text_below_last_table.strip() or text_above_first_table.strip())
                 
-                if is_between_empty:
+                # --- 測試 2: 掃描檔 PDF 判定法 (OpenCV 盲區像素投影檢測) ---
+                prev_img_np = page_cv_images[p_idx - 1]
+                curr_img_np = page_cv_images[p_idx]
+                
+                # 取得原圖影像的 y1 (上邊界) 和 y2 (下邊界)
+                _, _, _, last_y_max = last_block_prev_page["img_box"]
+                _, first_y_min, _, _ = first_block_curr_page["img_box"]
+                
+                # 檢查前一頁表格下方到頁尾、當前頁開頭到第一個表格上方是否有可見圖文
+                has_scanned_content_below = has_visible_content_in_crop(prev_img_np, last_y_max, prev_img_np.shape[0])
+                has_scanned_content_above = has_visible_content_in_crop(curr_img_np, 0, first_y_min)
+                
+                has_image_content_between = has_scanned_content_below or has_scanned_content_above
+                
+                # --- 綜合判定決定是否合併 ---
+                # 只有當「數位文字檢測」與「影像內容檢測」同時回傳乾淨空白時，才允許跨頁表格合併
+                if (not has_digital_text_between) and (not has_image_content_between):
                     last_block_prev_page["text"] += "\n" + first_block_curr_page["text"]
                     first_block_curr_page["is_merged_child"] = True
 
@@ -215,19 +264,16 @@ def main():
     if "df" not in st.session_state:
         st.session_state.df = pd.DataFrame(columns=["題目", "問題內容", "學生作答", "標準答案", "配分", "得分", "AI 評分理由"])
 
-    # --- API 客戶端初始化 (移入函數內避免全域 return 報錯) ---
+    # --- API 客戶端初始化 ---
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     
     if not GOOGLE_API_KEY:
         st.error("❌ 環境變數中找不到 GOOGLE_API_KEY，請確認 Streamlit Secrets 設定。")
-        st.stop()  # 使用 st.stop() 安全攔截，不傷結構
+        st.stop()
 
     try:
-        # 帶入憑證初始化 Google Vision Client
         options = ClientOptions(api_key=GOOGLE_API_KEY)
         vision_client = vision.ImageAnnotatorClient(client_options=options)
-        
-        # 初始化新版 Gemini Client (會自動讀取環境變數中的 GEMINI_API_KEY)
         gemini_client = Client() 
     except Exception as e:
         st.error(f"💥 初始化 API 失敗，請檢查環境變數與憑證：{e}")
@@ -275,11 +321,10 @@ def main():
     with col1:
         st.subheader("📝 結構化評分表")
         
-        # 互動式表格更新
         edited_df = st.data_editor(
             st.session_state.df,
             num_rows="dynamic",
-            use_container_width=True, # 新版標準寫法
+            use_container_width=True,
             height=600
         )
         st.session_state.df = edited_df
@@ -311,7 +356,6 @@ def main():
                             f"該題最高分（配分）：{row['配分']}\n"
                         )
                         try:
-                            # 呼叫最新的 Gemini 2.5 Pro 模型
                             response = gemini_client.models.generate_content(
                                 model='gemini-2.5-pro',
                                 contents=prompt,
