@@ -321,29 +321,35 @@ def main():
     with col1:
         st.subheader("📝 結構化評分表")
         
+        # 讓使用者可以手動調整或即時查看的編輯器
         edited_df = st.data_editor(
             st.session_state.df,
             num_rows="dynamic",
             use_container_width=True,
             height=600
         )
+        # 確保編輯器的任何變動立刻同步回 session_state
         st.session_state.df = edited_df
 
+        # --- 核心修正：每次渲染時，先即時計算當前 df 內的配分與得分 ---
         try:
             total_possible = pd.to_numeric(st.session_state.df["配分"]).sum()
             current_score = pd.to_numeric(st.session_state.df["得分"]).sum()
-        except:
+        except Exception:
             total_possible = 0
             current_score = 0
 
+        # 建立按鈕與分數顯示欄位
         btn_col, score_col = st.columns([1, 1])
 
         with btn_col:
             run_ai = st.button("🤖 執行 Gemini 自動批改", use_container_width=True)
         
         with score_col:
+            # 這裡會即時顯示加總成果
             st.markdown(f"### 🎯 目前得分：{current_score:.1f} / {total_possible:.1f}")
 
+        # --- 執行 AI 批改邏輯 ---
         if run_ai:
             with st.spinner("Gemini Pro 正在深入分析答案並評分中..."):
                 for index, row in st.session_state.df.iterrows():
@@ -368,13 +374,15 @@ def main():
                             
                             result: GradingResult = response.parsed
                             
-                            st.session_state.df.at[index, "得分"] = result.score
+                            # 寫入最新的得分與理由
+                            st.session_state.df.at[index, "得分"] = float(result.score)
                             st.session_state.df.at[index, "AI 評分理由"] = result.reason
                             
                         except Exception as e:
                             st.warning(f"第 {index+1} 題評分錯誤: {e}")
                 
                 st.success("🎉 全數批改完成！")
+                # 批改完成後強制全面刷新，讓最上方的 current_score 重新計算並完美顯示
                 st.rerun()
 
     with col2:
