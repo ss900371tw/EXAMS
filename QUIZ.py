@@ -102,7 +102,7 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                 
                 if w >= min_w and h >= min_h:
                     box = cv2.boxPoints(((cx, cy), (w, h), angle))
-                    box = np.int0(box)
+                    box = box.astype(int)
                     candidates.append(((cx, cy), (w, h), angle, box))
 
             # 依 Y 軸由上到下排序
@@ -339,7 +339,7 @@ def main():
 
     with col2:
         st.subheader("🔍 框選對齊視覺檢查")
-        if "debug_imgs" in st.session_state:
+        if "debug_images" in st.session_state:
             for i, img in enumerate(st.session_state.debug_images):
                 st.image(img, caption=f"偵測區域預覽 - 頁面 {i+1}")
 
