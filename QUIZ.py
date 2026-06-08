@@ -9,6 +9,7 @@ import pdfplumber
 from PIL import Image
 from pdf2image import convert_from_bytes
 from google.cloud import vision
+from google.api_core.client_options import ClientOptions
 
 # 1. 引入最新的 Gemini GenAI SDK
 from google.genai import Client
@@ -60,7 +61,6 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
     debug_images = []
 
     # 用來暫存每一頁解析出來的區塊資訊
-    # 結構: page_blocks[p_idx] = [ {"text": text, "bbox": (x0, y0, x1, y1)}, ... ]
     page_blocks = {} 
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -152,7 +152,6 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                     )
                     text = response.full_text_annotation.text.strip() if response.full_text_annotation.text else ""
 
-                # 儲存文字與其在 PDF 中的位置 (pdf_bbox 格式為 x0, y0, x1, y1)
                 page_blocks[p_idx].append({
                     "text": text,
                     "bbox": pdf_bbox
@@ -167,7 +166,6 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
         # --- 跨頁表格合併核心邏輯 ---
         total_pages = len(images)
         for p_idx in range(total_pages):
-            # 如果不是第一頁，且上一頁有表格，這一頁也有表格
             if p_idx > 0 and len(page_blocks[p_idx - 1]) > 0 and len(page_blocks[p_idx]) > 0:
                 
                 prev_page = pdf.pages[p_idx - 1]
@@ -176,8 +174,6 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                 last_block_prev_page = page_blocks[p_idx - 1][-1]
                 first_block_curr_page = page_blocks[p_idx][0]
                 
-                # 1. 取得上一頁最後一個表格下方，到頁尾的區域
-                # cropped 範圍: 左=0, 上=最後表格的底(y1), 右=頁寬, 下=頁高
                 text_below_last_table = ""
                 try:
                     bottom_crop = prev_page.crop((0, last_block_prev_page["bbox"][3], prev_page.width, prev_page.height))
@@ -185,8 +181,6 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                 except Exception:
                     pass
                 
-                # 2. 取得這一頁頁首，到第一個表格上方之間的區域
-                # cropped 範圍: 左=0, 上=0, 右=頁寬, 下=第一個表格的頂(y0)
                 text_above_first_table = ""
                 try:
                     top_crop = curr_page.crop((0, 0, curr_page.width, first_block_curr_page["bbox"][0]))
@@ -194,13 +188,10 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                 except Exception:
                     pass
                 
-                # 3. 判定指標：這兩個夾縫區塊去除空白後，是否完全沒有文字
                 is_between_empty = (not text_below_last_table.strip()) and (not text_above_first_table.strip())
                 
                 if is_between_empty:
-                    # 符合指標：將這一頁第一個表格的文字，合併到上一頁最後一個表格
                     last_block_prev_page["text"] += "\n" + first_block_curr_page["text"]
-                    # 標記這一頁第一個區塊已被合併（後續不單獨加入最終結果）
                     first_block_curr_page["is_merged_child"] = True
 
         # --- 重新打包成最終的文字列表 ---
@@ -211,33 +202,36 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
 
     return all_text_results, debug_images
 
-# --- 2. Streamlit UI ---
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# --- 2. Streamlit UI ---
 
 def main():
     st.set_page_config(page_title="AI 評分系統", layout="wide")
     st.title("📑 全自動考卷批改工作台 (Gemini Pro 強化版)")
 
-    # 💡 加上這段：初始化 debug_images 變數
+    # 初始化 session_state
     if "debug_images" not in st.session_state:
-        st.session_state.debug_images = []  # 給它一個空的列表作為初始值
+        st.session_state.debug_images = []
+    if "df" not in st.session_state:
+        st.session_state.df = pd.DataFrame(columns=["題目", "問題內容", "學生作答", "標準答案", "配分", "得分", "AI 評分理由"])
 
-    # API 憑證與客戶端初始化
+    # --- API 客戶端初始化 (移入函數內避免全域 return 報錯) ---
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     
-    # 建議在環境變數或 Streamlit secrets 中設定 GEMINI_API_KEY
-    
+    if not GOOGLE_API_KEY:
+        st.error("❌ 環境變數中找不到 GOOGLE_API_KEY，請確認 Streamlit Secrets 設定。")
+        st.stop()  # 使用 st.stop() 安全攔截，不傷結構
+
     try:
-        vision_client = vision.ImageAnnotatorClient()
+        # 帶入憑證初始化 Google Vision Client
+        options = ClientOptions(api_key=GOOGLE_API_KEY)
+        vision_client = vision.ImageAnnotatorClient(client_options=options)
         
         # 初始化新版 Gemini Client (會自動讀取環境變數中的 GEMINI_API_KEY)
         gemini_client = Client() 
     except Exception as e:
-        st.error(f"初始化 API 失敗，請檢查環境變數與憑證：{e}")
+        st.error(f"💥 初始化 API 失敗，請檢查環境變數與憑證：{e}")
         return
-
-    if "df" not in st.session_state:
-        st.session_state.df = pd.DataFrame(columns=["題目", "問題內容", "學生作答", "標準答案", "配分", "得分", "AI 評分理由"])
 
     with st.sidebar:
         st.header("📥 上傳 PDF 來源")
@@ -280,12 +274,14 @@ def main():
 
     with col1:
         st.subheader("📝 結構化評分表")
+        
+        # 互動式表格更新
         edited_df = st.data_editor(
             st.session_state.df,
             num_rows="dynamic",
-            width="stretch",          # 新版改用 width="stretch" 撐滿寬度
+            use_container_width=True, # 新版標準寫法
             height=600
-            )
+        )
         st.session_state.df = edited_df
 
         try:
@@ -320,14 +316,12 @@ def main():
                                 model='gemini-2.5-pro',
                                 contents=prompt,
                                 config=types.GenerateContentConfig(
-                                    # 利用 Pydantic 強制要求結構化輸出，不需要再靠 RegExp 解析文字
                                     response_mime_type="application/json",
                                     response_schema=GradingResult,
-                                    temperature=0.2, # 降低隨機性，讓評分更嚴謹客觀
+                                    temperature=0.2, 
                                 ),
                             )
                             
-                            # 透過 parsed 直接拿取物件屬性，安全又快速
                             result: GradingResult = response.parsed
                             
                             st.session_state.df.at[index, "得分"] = result.score
@@ -335,13 +329,17 @@ def main():
                             
                         except Exception as e:
                             st.warning(f"第 {index+1} 題評分錯誤: {e}")
+                
+                st.success("🎉 全數批改完成！")
                 st.rerun()
 
     with col2:
         st.subheader("🔍 框選對齊視覺檢查")
-        if "debug_images" in st.session_state:
+        if st.session_state.debug_images:
             for i, img in enumerate(st.session_state.debug_images):
                 st.image(img, caption=f"偵測區域預覽 - 頁面 {i+1}")
+        else:
+            st.info("暫無視覺檢查影像，請先上傳 PDF 並點擊開始全自動解析。")
 
 if __name__ == "__main__":
     main()
