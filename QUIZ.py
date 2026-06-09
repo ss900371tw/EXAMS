@@ -380,8 +380,9 @@ def main():
                         f"你給出的分數「絕對不可以」超過該題的最高配分。\n"
                     )
                     try:
+                        # --- 執行 AI 批改邏輯 ---
                         response = gemini_client.models.generate_content(
-                            model='gemini-2.5-pro',
+                            model='gemini-2.0-pro-exp-0205',  # 💡 修改此處
                             contents=prompt,
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
