@@ -9,3 +9,4 @@ google-cloud-vision
 google-genai
 pydantic
 poppler-utils
+openai
