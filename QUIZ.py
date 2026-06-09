@@ -88,10 +88,10 @@ def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     # 超過閾值代表中間夾有題目文字或線條，兩者不應合併
     return black_pixel_ratio > threshold_ratio
 
-def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_debug=False):
+def detect_and_ocr_boxes(pdf_bytes, vision_client, gemini_client, min_w=400, min_h=100, need_debug=False):
     """
-    結合 OpenCV 定位與 pdfplumber/Google Vision 的混合文字提取。
-    特別針對中英文混雜加強 Google Vision Context 提示。
+    結合 OpenCV 定位與 pdfplumber/Gemini 2.5 的混合文字提取。
+    💡 增加了 gemini_client 參數，用來精準識別手寫中文字與複雜公式。
     """
     images = convert_from_bytes(pdf_bytes, dpi=350)
     all_text_results = []
@@ -165,8 +165,7 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_de
                 except Exception:
                     extracted_text = None
 
-                # 修改 detect_and_ocr_boxes 函式內，原本處理 OCR 的區塊：
-
+                # --- 核心 OCR 區塊修改開始 ---
                 if extracted_text and extracted_text.strip():
                     text = extracted_text.strip()
                 else:
@@ -179,12 +178,10 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_de
                     if w > pad*2 and h > pad*2:
                         warped = warped[pad:int(h)-pad, pad:int(w)-pad]
                     
-                    # 💡 優化點 1：傳給 Gemini 的影像不需要做 enhance_for_ocr，保留最真實的手寫灰階或色彩
+                    # 💡 優化：不經過複雜的點陣圖強化，Gemini 更喜歡看大自然原本真實、平滑的邊緣
                     cropped_img = Image.fromarray(warped)
 
-                    # 💡 優化點 2：直接利用現有的 gemini_client 進行多模態辨識
                     try:
-                        # 將裁剪下來的區塊轉成 Gemini 接受的 bytes 格式
                         buf = io.BytesIO()
                         cropped_img.save(buf, format="JPEG")
                         image_bytes = buf.getvalue()
@@ -195,10 +192,11 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_de
                             "如果是公式，請盡量用清晰的文字或數學符號呈現。"
                         )
                         
+                        # 💡 調整：使用更標準且不容易與舊版 SDK 衝突的圖片參數格式形式
                         gemini_ocr_response = gemini_client.models.generate_content(
-                            model='gemini-2.5-flash', # OCR 任務用 flash 速度快且成本低，效果就極好
+                            model='gemini-2.5-flash', 
                             contents=[
-                                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                                {"data": image_bytes, "mime_type": "image/jpeg"},
                                 ocr_prompt
                             ]
                         )
@@ -207,6 +205,7 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_de
                     except Exception as e:
                         st.warning(f"區域 Gemini OCR 發生錯誤: {e}")
                         text = ""
+                # --- 核心 OCR 區塊修改結束 ---
 
                 page_blocks[p_idx].append({
                     "text": text,
@@ -220,7 +219,7 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_de
             if need_debug:
                 debug_images.append(Image.fromarray(img_np))
 
-        # --- 跨頁表格合併核心邏輯 ---
+        # --- 跨頁表格合併邏輯 ---
         total_pages = len(images)
         for p_idx in range(total_pages):
             if p_idx > 0 and len(page_blocks[p_idx - 1]) > 0 and len(page_blocks[p_idx]) > 0:
@@ -305,10 +304,11 @@ def main():
                 a_bytes = pdf_a.read()
                 p_bytes = pdf_p.read()
 
-                q_texts, _ = detect_and_ocr_boxes(q_bytes, vision_client)
-                s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, vision_client, need_debug=True)
-                a_texts, _ = detect_and_ocr_boxes(a_bytes, vision_client)
-                p_texts, _ = detect_and_ocr_boxes(p_bytes, vision_client)
+                # 💡 在這裡呼叫時，要把 vision_client 後面多補上 gemini_client
+                q_texts, _ = detect_and_ocr_boxes(q_bytes, vision_client, gemini_client)
+                s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, vision_client, gemini_client, need_debug=True)
+                a_texts, _ = detect_and_ocr_boxes(a_bytes, vision_client, gemini_client)
+                p_texts, _ = detect_and_ocr_boxes(p_bytes, vision_client, gemini_client)
                 
                 num_questions = max(len(q_texts), len(s_texts), len(a_texts), len(p_texts))
                 
