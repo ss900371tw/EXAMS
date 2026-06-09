@@ -339,7 +339,7 @@ def main():
                     )
                     try:
                         response = gemini_client.models.generate_content(
-                            model='gemini-2.0-flash',  
+                            model='gemini-2.5-pro',  
                             contents=[prompt, student_img],
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
