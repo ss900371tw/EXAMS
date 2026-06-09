@@ -272,22 +272,28 @@ def main():
         # 💡 為了在 data_editor 隱藏無法渲染的 PIL.Image 欄位，我們建立一個顯示用的副本
         display_df = st.session_state.df.copy()
         # 將 Image 物件轉為可讀字串供表格顯示
-        display_df["學生作答(影像物件)"] = display_df["學生作答(影像物件)"].apply(lambda x: "📷 影像已就緒 (點擊右側觀看)" if x is not None else "⚠️ 無影像")
+        display_df["學生作答(影像物件)"] = display_df["學生作答(影像物件)"].apply(lambda x: "📷 影像已就緒 (點擊此列右側觀看)" if x is not None else "⚠️ 無影像")
 
+        # 🌟【關鍵修改點】🌟 加上了 on_select="rerun" 與 selection_mode="rows"
+        # 這會強制開啟點擊整列（Row Selection）的功能，並在點擊時重新整理畫面讓右側面板更新！
         edited_display_df = st.data_editor(
             display_df,
             num_rows="dynamic",
             use_container_width=True,
             height=500,
-            key="my_data_editor"
+            key="my_data_editor",
+            on_select="rerun",
+            selection_mode="rows"
         )
         
-        # 將使用者在表格中修改的「得分」與「理由」同步回 session_state.df
-        st.session_state.df["得分"] = edited_display_df["得分"]
-        st.session_state.df["AI 評分理由"] = edited_display_df["AI 評分理由"]
-        st.session_state.df["問題內容"] = edited_display_df["問題內容"]
-        st.session_state.df["標準答案"] = edited_display_df["標準答案"]
-        st.session_state.df["配分"] = edited_display_df["配分"]
+        # 將使用者在表格中修改的欄位動態同步回 session_state.df
+        # 用以此防止丟失使用者手動微調的數據
+        if len(edited_display_df) == len(st.session_state.df):
+            st.session_state.df["得分"] = edited_display_df["得分"]
+            st.session_state.df["AI 評分理由"] = edited_display_df["AI 評分理由"]
+            st.session_state.df["問題內容"] = edited_display_df["問題內容"]
+            st.session_state.df["標準答案"] = edited_display_df["標準答案"]
+            st.session_state.df["配分"] = edited_display_df["配分"]
 
         try:
             current_score = pd.to_numeric(st.session_state.df["得分"]).sum()
@@ -312,7 +318,6 @@ def main():
                 student_img = row["學生作答(影像物件)"]
                 
                 if student_img is not None:
-                    # 💡 Prompt 全面翻新，指示 Gemini 同時閱讀文字與圖片
                     prompt = (
                         f"你是一位專業且嚴謹的審查老師。此考卷採取「總分 100 分制」，請根據給予的題目資訊與附加的學生作答圖片進行精確評分：\n\n"
                         f"【單題題目資訊】\n"
@@ -326,7 +331,6 @@ def main():
                         f"4. 嚴重警告：你給出的分數「絕對不可以」超過該題的最高配分。\n"
                     )
                     try:
-                        # 💡 核心多模態傳參：直接將 prompt 文字與 PIL.Image 放入 contents 陣列
                         response = gemini_client.models.generate_content(
                             model='gemini-2.0-pro-exp-0205',  
                             contents=[prompt, student_img],
@@ -354,13 +358,14 @@ def main():
             
     with col2:
         st.subheader("🔍 盲區視覺複核面板")
-        st.info("💡 提示：在左側表格中點選任意儲存格，下方即可同步切換顯示該題學生的原始作答區塊圖片。")
+        st.info("💡 提示：點擊左側表格最左方的序號或任一列，右側即會即時切換至該題圖片。")
         
-        # 利用 data_editor 的內建選取項，找出使用者目前點擊的是第幾列
+        # 🌟【聯動邏輯核心】🌟
+        # 當 data_editor 有選取項（selection），且 rows 有被選中的 index 時：
         if "my_data_editor" in st.session_state and st.session_state.my_data_editor.get("selection"):
             selected_rows = st.session_state.my_data_editor["selection"]["rows"]
             if selected_rows:
-                selected_idx = selected_rows[0]
+                selected_idx = selected_rows[0] # 取出使用者點擊的 row index
                 if selected_idx < len(st.session_state.df):
                     row_data = st.session_state.df.iloc[selected_idx]
                     st.markdown(f"#### 📋 當前檢視：**{row_data['題目']}**")
@@ -369,16 +374,24 @@ def main():
                     
                     img_obj = row_data["學生作答(影像物件)"]
                     if img_obj is not None:
-                        st.image(img_obj, use_container_width=True, caption=f"學生作答的原始裁切盲區影像")
+                        st.image(img_obj, use_container_width=True, caption=f"第 {selected_idx+1} 題 學生作答盲區裁剪影像")
                     else:
-                        st.warning("該題無對應的學生作答影像")
+                        st.warning("⚠️ 該題無對應的學生作答影像")
+            else:
+                # 雖有選取區但點擊在空處，預設顯示第一題
+                show_default_row()
         else:
-            # 預設把第一題拿出來秀
-            if len(st.session_state.df) > 0:
-                first_row = st.session_state.df.iloc[0]
-                st.markdown(f"#### 📋 預覽第一題：**{first_row['題目']}**")
-                if first_row["學生作答(影像物件)"] is not None:
-                    st.image(first_row["學生作答(影像物件)"], use_container_width=True)
+            # 畫面剛開啟、尚未有任何點擊時的預設顯示
+            show_default_row()
+
+def show_default_row():
+    """輔助函式：預設顯示表格第一題的預覽"""
+    if len(st.session_state.df) > 0:
+        first_row = st.session_state.df.iloc[0]
+        st.markdown(f"#### 📋 預覽第一題：**{first_row['題目']}**")
+        st.markdown(f"**問題：** {first_row['問題內容']}")
+        if first_row["學生作答(影像物件)"] is not None:
+            st.image(first_row["學生作答(影像物件)"], use_container_width=True)
 
 if __name__ == "__main__":
     main()
