@@ -283,8 +283,7 @@ def main():
         st.stop()
 
     try:
-        options = ClientOptions(api_key=GOOGLE_API_KEY)
-        vision_client = vision.ImageAnnotatorClient(client_options=options)
+        # 💡 移除 vision_client 的初始化，只保留全新的 Google GenAI Client
         gemini_client = Client() 
     except Exception as e:
         st.error(f"💥 初始化 API 失敗，請檢查環境變數與憑證：{e}")
@@ -304,11 +303,11 @@ def main():
                 a_bytes = pdf_a.read()
                 p_bytes = pdf_p.read()
 
-                # 💡 在這裡呼叫時，要把 vision_client 後面多補上 gemini_client
-                q_texts, _ = detect_and_ocr_boxes(q_bytes, vision_client, gemini_client)
-                s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, vision_client, gemini_client, need_debug=True)
-                a_texts, _ = detect_and_ocr_boxes(a_bytes, vision_client, gemini_client)
-                p_texts, _ = detect_and_ocr_boxes(p_bytes, vision_client, gemini_client)
+                # 💡 呼叫時，直接把 vision_client 參數拿掉
+                q_texts, _ = detect_and_ocr_boxes(q_bytes, gemini_client)
+                s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, gemini_client, need_debug=True)
+                a_texts, _ = detect_and_ocr_boxes(a_bytes, gemini_client)
+                p_texts, _ = detect_and_ocr_boxes(p_bytes, gemini_client)
                 
                 num_questions = max(len(q_texts), len(s_texts), len(a_texts), len(p_texts))
                 
