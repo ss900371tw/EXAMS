@@ -196,7 +196,7 @@ def detect_and_ocr_boxes(pdf_bytes, gemini_client, min_w=400, min_h=100, need_de
                         
                         # 💡 調整：使用更標準且不容易與舊版 SDK 衝突的圖片參數格式形式
                         gemini_ocr_response = gemini_client.models.generate_content(
-                            model='gemini-3.5-pro', 
+                            model='gemini-2.5-flash', 
                             contents=[
                                 {"data": image_bytes, "mime_type": "image/jpeg"},
                                 ocr_prompt
