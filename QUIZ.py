@@ -264,30 +264,27 @@ def main():
                 st.session_state.df = pd.DataFrame(data)
                 st.success(f"解析完成！共對齊 {num_questions} 個多模態區塊。")
 
+# --- 畫面佈局與舊版相容連動邏輯 ---
     col1, col2 = st.columns([7, 5])
     
     with col1:
         st.subheader("📝 結構化評分表")
         
-        # 💡 為了在 data_editor 隱藏無法渲染的 PIL.Image 欄位，我們建立一個顯示用的副本
         display_df = st.session_state.df.copy()
-        # 將 Image 物件轉為可讀字串供表格顯示
-        display_df["學生作答(影像物件)"] = display_df["學生作答(影像物件)"].apply(lambda x: "📷 影像已就緒 (點擊此列右側觀看)" if x is not None else "⚠️ 無影像")
+        display_df["學生作答(影像物件)"] = display_df["學生作答(影像物件)"].apply(
+            lambda x: "📷 影像已就緒 (請用下方下拉選單切換檢視)" if x is not None else "⚠️ 無影像"
+        )
 
-        # 🌟【關鍵修改點】🌟 加上了 on_select="rerun" 與 selection_mode="rows"
-        # 這會強制開啟點擊整列（Row Selection）的功能，並在點擊時重新整理畫面讓右側面板更新！
+        # 💡 移除舊版本不支援的 on_select 與 selection_mode
         edited_display_df = st.data_editor(
             display_df,
             num_rows="dynamic",
             use_container_width=True,
-            height=500,
-            key="my_data_editor",
-            on_select="rerun",
-            selection_mode="rows"
+            height=400,
+            key="my_data_editor"
         )
         
-        # 將使用者在表格中修改的欄位動態同步回 session_state.df
-        # 用以此防止丟失使用者手動微調的數據
+        # 同步資料
         if len(edited_display_df) == len(st.session_state.df):
             st.session_state.df["得分"] = edited_display_df["得分"]
             st.session_state.df["AI 評分理由"] = edited_display_df["AI 評分理由"]
@@ -306,6 +303,17 @@ def main():
         with score_col:
             st.markdown(f"### 🎯 目前總分：{current_score:.1f} / 100.0")
 
+        # 🌟【舊版相容的連動神器】🌟 在表格下方放一個下拉選單供切換題號
+        st.write("---")
+        st.subheader("🔍 切換檢視題號")
+        if len(st.session_state.df) > 0:
+            q_list = st.session_state.df["題目"].tolist()
+            selected_q_name = st.selectbox("請選擇你想在右側複核的題目：", q_list, index=0)
+            # 找出選中題目的 index
+            selected_idx = q_list.index(selected_q_name)
+        else:
+            selected_idx = None
+
         # --- 執行 多模態 AI 批改邏輯 ---
         if run_ai:
             temp_df = st.session_state.df.copy()
@@ -314,7 +322,6 @@ def main():
             
             for index, row in temp_df.iterrows():
                 status_text.markdown(f"⏳ **Gemini 正在視覺辨識並批改第 {index + 1} / {num_rows} 題...**")
-                
                 student_img = row["學生作答(影像物件)"]
                 
                 if student_img is not None:
@@ -340,11 +347,9 @@ def main():
                                 temperature=0.1, 
                             ),
                         )
-                        
                         result: GradingResult = response.parsed
                         temp_df.at[index, "得分"] = float(result.score)
                         temp_df.at[index, "AI 評分理由"] = result.reason
-                        
                     except Exception as e:
                         st.warning(f"第 {index+1} 題多模態評分發生錯誤: {e}")
                 else:
@@ -358,40 +363,20 @@ def main():
             
     with col2:
         st.subheader("🔍 盲區視覺複核面板")
-        st.info("💡 提示：點擊左側表格最左方的序號或任一列，右側即會即時切換至該題圖片。")
         
-        # 🌟【聯動邏輯核心】🌟
-        # 當 data_editor 有選取項（selection），且 rows 有被選中的 index 時：
-        if "my_data_editor" in st.session_state and st.session_state.my_data_editor.get("selection"):
-            selected_rows = st.session_state.my_data_editor["selection"]["rows"]
-            if selected_rows:
-                selected_idx = selected_rows[0] # 取出使用者點擊的 row index
-                if selected_idx < len(st.session_state.df):
-                    row_data = st.session_state.df.iloc[selected_idx]
-                    st.markdown(f"#### 📋 當前檢視：**{row_data['題目']}**")
-                    st.markdown(f"**問題：** {row_data['問題內容']}")
-                    st.markdown(f"**標準答案：** {row_data['標準答案']}")
-                    
-                    img_obj = row_data["學生作答(影像物件)"]
-                    if img_obj is not None:
-                        st.image(img_obj, use_container_width=True, caption=f"第 {selected_idx+1} 題 學生作答盲區裁剪影像")
-                    else:
-                        st.warning("⚠️ 該題無對應的學生作答影像")
+        if selected_idx is not None and selected_idx < len(st.session_state.df):
+            row_data = st.session_state.df.iloc[selected_idx]
+            st.markdown(f"#### 📋 當前檢視：**{row_data['題目']}**")
+            st.markdown(f"**問題：** {row_data['問題內容']}")
+            st.markdown(f"**標準答案：** {row_data['標準答案']}")
+            
+            img_obj = row_data["學生作答(影像物件)"]
+            if img_obj is not None:
+                st.image(img_obj, use_container_width=True, caption=f"第 {selected_idx+1} 題 學生作答盲區裁剪影像")
             else:
-                # 雖有選取區但點擊在空處，預設顯示第一題
-                show_default_row()
+                st.warning("⚠️ 該題無對應的學生作答影像")
         else:
-            # 畫面剛開啟、尚未有任何點擊時的預設顯示
-            show_default_row()
-
-def show_default_row():
-    """輔助函式：預設顯示表格第一題的預覽"""
-    if len(st.session_state.df) > 0:
-        first_row = st.session_state.df.iloc[0]
-        st.markdown(f"#### 📋 預覽第一題：**{first_row['題目']}**")
-        st.markdown(f"**問題：** {first_row['問題內容']}")
-        if first_row["學生作答(影像物件)"] is not None:
-            st.image(first_row["學生作答(影像物件)"], use_container_width=True)
+            st.info("💡 項目載入後，右側將即時顯示指定題目的原始手寫作答圖片。")
 
 if __name__ == "__main__":
     main()
