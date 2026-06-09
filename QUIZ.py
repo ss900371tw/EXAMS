@@ -6,15 +6,19 @@ import io
 import os
 import re
 import pdfplumber
+import base64  # 💡 為了將圖片傳給 GPT-4o，需要 base64 編碼
 from PIL import Image
 from pdf2image import convert_from_bytes
 from google.cloud import vision
 from google.api_core.client_options import ClientOptions
 
-# 1. 引入最新的 Gemini GenAI SDK
-from google.genai import Client
+# 1. 引入最新的 Gemini GenAI SDK (負責後續結構化批改)
+from google.genai import Client as GeminiClient
 from google.genai import types
 from pydantic import BaseModel, Field
+
+# 2. 引入 OpenAI SDK (負責精準區域 OCR)
+from openai import OpenAI
 
 # --- Define Pydantic Schema for Gemini Structured Output ---
 
@@ -37,23 +41,15 @@ def order_points_robust(pts):
 
 def enhance_for_ocr(img_np):
     """
-    優化後的影像強化邏輯：
-    降微調去噪強度，並加入微銳利化，保留中文字結構，避免被誤判為英文字母。
+    優化後的影像強化邏輯
     """
     if img_np is None or img_np.size == 0:
         return None    
     
-    # 1. 轉灰階
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    
-    # 2. 增加對比度 (CLAHE) - 讓模糊的字體與背景對比更強烈
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
-    
-    # 3. 適度去噪 (降低強度，避免抹除中文字的關鍵細節)
     denoised = cv2.fastNlMeansDenoising(enhanced, None, 5, 7, 21)    
-    
-    # 4. 微銳利化核心 (提升中英文邊緣對比，防止混雜時字體模糊)
     kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
     sharpened = cv2.filter2D(denoised, -1, kernel)
     
@@ -61,44 +57,35 @@ def enhance_for_ocr(img_np):
 
 def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     """
-    針對掃描檔的盲區內容偵測：
-    透過二值化分析特定 Y 軸區間內是否存在非空白內容（文字或符號）。
+    針對掃描檔的盲區內容偵測
     """
     h, w, _ = img_np.shape
-    
-    # 安全範圍限縮，避免陣列越界
     y_start = max(0, int(y_start))
     y_end = min(h, int(y_end))
     
-    # 如果裁剪區間過小，視為無阻隔文字
     if (y_end - y_start) < 10:
         return False
         
     crop_roi = img_np[y_start:y_end, 0:w]
     gray = cv2.cvtColor(crop_roi, cv2.COLOR_RGB2GRAY)
-    
-    # 使用大津二值化將文字（深色）與背景（白色）分離
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # 計算非零像素（即文字內容）的比例
     non_zero_count = cv2.countNonZero(binary)
     total_pixels = binary.size
     black_pixel_ratio = non_zero_count / total_pixels
     
-    # 超過閾值代表中間夾有題目文字或線條，兩者不應合併
     return black_pixel_ratio > threshold_ratio
 
-def detect_and_ocr_boxes(pdf_bytes, gemini_client, min_w=400, min_h=100, need_debug=False):
+def detect_and_ocr_boxes(pdf_bytes, openai_client, min_w=400, min_h=100, need_debug=False):
     """
-    結合 OpenCV 定位與 pdfplumber/Gemini 2.5 的混合文字提取。
-    💡 增加了 gemini_client 參數，用來精準識別手寫中文字與複雜公式。
+    結合 OpenCV 定位與 pdfplumber/GPT-4o 的混合文字提取。
+    💡 調整為使用 openai_client 來執行無情且精準的框選 OCR。
     """
     images = convert_from_bytes(pdf_bytes, dpi=350)
     all_text_results = []
     debug_images = []
 
     page_blocks = {} 
-    page_cv_images = {} # 存放各頁的原始 ndarray
+    page_cv_images = {} 
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for p_idx, img in enumerate(images):
@@ -143,7 +130,6 @@ def detect_and_ocr_boxes(pdf_bytes, gemini_client, min_w=400, min_h=100, need_de
                     box = box.astype(int)
                     candidates.append(((cx, cy), (w, h), angle, box))
 
-            # 依 Y 軸由上到下排序
             candidates = sorted(candidates, key=lambda x: x[0][1])
             page_blocks[p_idx] = []
 
@@ -165,7 +151,7 @@ def detect_and_ocr_boxes(pdf_bytes, gemini_client, min_w=400, min_h=100, need_de
                 except Exception:
                     extracted_text = None
 
-                # --- 核心 OCR 區塊修改開始 ---
+                # --- 🔀 核心修改：切換至 GPT-4o 執行 OCR 區塊 ---
                 if extracted_text and extracted_text.strip():
                     text = extracted_text.strip()
                 else:
@@ -178,7 +164,6 @@ def detect_and_ocr_boxes(pdf_bytes, gemini_client, min_w=400, min_h=100, need_de
                     if w > pad*2 and h > pad*2:
                         warped = warped[pad:int(h)-pad, pad:int(w)-pad]
                     
-                    # 💡 優化：不經過複雜的點陣圖強化，Gemini 更喜歡看大自然原本真實、平滑的邊緣
                     cropped_img = Image.fromarray(warped)
 
                     try:
@@ -186,22 +171,40 @@ def detect_and_ocr_boxes(pdf_bytes, gemini_client, min_w=400, min_h=100, need_de
                         cropped_img.save(buf, format="JPEG")
                         image_bytes = buf.getvalue()
                         
+                        # 將圖片轉成 GPT-4o 所需的 Base64 字串
+                        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                        
+                        # 💡 完美融入您的嚴格 OCR 規則
                         ocr_prompt = (
-                        "請將框選出的文字輸出給我 並且 不要新增在框框中沒有出現的解釋"
+                            "請將框選出的文字精準輸出給我。嚴格遵守以下規則：\n"
+                            "1. 只輸出圖片框框中實際存在的文字，絕對不要新增任何框框中沒有出現的解釋、摘要或延伸說明。\n"
+                            "2. 不要包含任何前後引言、客套話或補充說明（例如：『以下是辨識結果』），直接輸出辨識內容即可。\n"
+                            "3. 還有不要把中文識別成英文，英文識別成中文。"
                         )
                         
-                        # 💡 調整：使用更標準且不容易與舊版 SDK 衝突的圖片參數格式形式
-                        gemini_ocr_response = gemini_client.models.generate_content(
-                        model='gemini-2.0-flash',  # 💡 修改此處
-                        contents=[
-                            {"data": image_bytes, "mime_type": "image/jpeg"},
-                            ocr_prompt
-                            ]
+                        # 呼叫 GPT-4o
+                        response = openai_client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": ocr_prompt},
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": f"data:image/jpeg;base64,{base64_image}"
+                                            }
+                                        }
+                                    ]
+                                }
+                            ],
+                            temperature=0.0  # 設為 0.0 確保輸出最精確、不發散
                         )
-                        text = gemini_ocr_response.text.strip() if gemini_ocr_response.text else ""
+                        text = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
                     
                     except Exception as e:
-                        st.warning(f"區域 Gemini OCR 發生錯誤: {e}")
+                        st.warning(f"區域 GPT-4o OCR 發生錯誤: {e}")
                         text = ""
                 # --- 核心 OCR 區塊修改結束 ---
 
@@ -267,7 +270,7 @@ def detect_and_ocr_boxes(pdf_bytes, gemini_client, min_w=400, min_h=100, need_de
 
 def main():
     st.set_page_config(page_title="AI 評分系統", layout="wide")
-    st.title("📑 全自動考卷批改工作台 (Gemini Pro 100分制版)")
+    st.title("📑 全自動考卷批改工作台 (GPT-4o OCR + Gemini 2.0 批改版)")
 
     if "debug_images" not in st.session_state:
         st.session_state.debug_images = []
@@ -275,14 +278,20 @@ def main():
         st.session_state.df = pd.DataFrame(columns=["題目", "問題內容", "學生作答", "標準答案", "配分", "得分", "AI 評分理由"])
 
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # 💡 新增 OpenAI 金鑰檢查
     
     if not GOOGLE_API_KEY:
         st.error("❌ 環境變數中找不到 GOOGLE_API_KEY，請確認 Streamlit Secrets 設定。")
         st.stop()
+        
+    if not OPENAI_API_KEY:
+        st.error("❌ 環境變數中找不到 OPENAI_API_KEY，請確認 Streamlit Secrets 設定。")
+        st.stop()
 
     try:
-        # 💡 移除 vision_client 的初始化，只保留全新的 Google GenAI Client
-        gemini_client = Client() 
+        # 初始化兩個大模型 Client 
+        gemini_client = GeminiClient() 
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception as e:
         st.error(f"💥 初始化 API 失敗，請檢查環境變數與憑證：{e}")
         return
@@ -295,17 +304,17 @@ def main():
         pdf_p = st.file_uploader("4. 配分 PDF", type="pdf")
         
         if st.button("🚀 開始全自動解析") and pdf_q and pdf_s and pdf_a and pdf_p:
-            with st.spinner("正在執行精準座標對齊與文字提取..."):
+            with st.spinner("正在執行精準座標對齊與 GPT-4o 視覺提取..."):
                 q_bytes = pdf_q.read()
                 s_bytes = pdf_s.read()
                 a_bytes = pdf_a.read()
                 p_bytes = pdf_p.read()
 
-                # 💡 呼叫時，直接把 vision_client 參數拿掉
-                q_texts, _ = detect_and_ocr_boxes(q_bytes, gemini_client)
-                s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, gemini_client, need_debug=True)
-                a_texts, _ = detect_and_ocr_boxes(a_bytes, gemini_client)
-                p_texts, _ = detect_and_ocr_boxes(p_bytes, gemini_client)
+                # 💡 將 openai_client 傳入解析函式
+                q_texts, _ = detect_and_ocr_boxes(q_bytes, openai_client)
+                s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, openai_client, need_debug=True)
+                a_texts, _ = detect_and_ocr_boxes(a_bytes, openai_client)
+                p_texts, _ = detect_and_ocr_boxes(p_bytes, openai_client)
                 
                 num_questions = max(len(q_texts), len(s_texts), len(a_texts), len(p_texts))
                 
@@ -376,9 +385,8 @@ def main():
                         f"你給出的分數「絕對不可以」超過該題的最高配分。\n"
                     )
                     try:
-                        # --- 執行 AI 批改邏輯 ---
                         response = gemini_client.models.generate_content(
-                            model='gemini-2.0-pro-exp-0205',  # 💡 修改此處
+                            model='gemini-2.0-pro-exp-0205',  
                             contents=prompt,
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
