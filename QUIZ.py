@@ -37,18 +37,27 @@ def order_points_robust(pts):
 
 def enhance_for_ocr(img_np):
     """
-    影像強化邏輯：轉灰階 -> CLAHE 對比強化 -> 非局部均值去噪 (Denoising)
+    優化後的影像強化邏輯：
+    降微調去噪強度，並加入微銳利化，保留中文字結構，避免被誤判為英文字母。
     """
     if img_np is None or img_np.size == 0:
         return None    
+    
     # 1. 轉灰階
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    
     # 2. 增加對比度 (CLAHE) - 讓模糊的字體與背景對比更強烈
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
-    # 3. 去噪處理 (Denoising) - 替換原本的銳利化
-    denoised = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)    
-    return denoised
+    
+    # 3. 適度去噪 (降低強度，避免抹除中文字的關鍵細節)
+    denoised = cv2.fastNlMeansDenoising(enhanced, None, 5, 7, 21)    
+    
+    # 4. 微銳利化核心 (提升中英文邊緣對比，防止混雜時字體模糊)
+    kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
+    sharpened = cv2.filter2D(denoised, -1, kernel)
+    
+    return sharpened
 
 def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     """
@@ -82,6 +91,7 @@ def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
 def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_debug=False):
     """
     結合 OpenCV 定位與 pdfplumber/Google Vision 的混合文字提取。
+    特別針對中英文混雜加強 Google Vision Context 提示。
     """
     images = convert_from_bytes(pdf_bytes, dpi=350)
     all_text_results = []
@@ -171,9 +181,13 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_de
 
                     buf = io.BytesIO()
                     cropped_img.save(buf, format="JPEG")
-                    image_context = vision.ImageContext(language_hints=["zh-Hant", "en"])
+                    
+                    # 💡 【核心優化】精準設定語言提示
+                    # 將 zh-Hant 設為最主要提示，強制系統使用支援亞洲雙語混雜的 OCR 模型
+                    image_context = vision.ImageContext(language_hints=["zh-Hant", "zh", "en"])
                     vision_img = vision.Image(content=buf.getvalue())
 
+                    # 使用 document_text_detection 處理密集/混雜段落文字
                     response = vision_client.document_text_detection(
                         image=vision_img, 
                         image_context=image_context
@@ -317,7 +331,6 @@ def main():
         
         st.session_state.df = edited_df
 
-        # --- 🛠️ 修正：計算當前 df 內學生的實得分數 ---
         try:
             current_score = pd.to_numeric(st.session_state.df["得分"]).sum()
         except Exception:
@@ -329,24 +342,19 @@ def main():
             run_ai = st.button("🤖 執行 Gemini 自動批改", use_container_width=True)
         
         with score_col:
-            # 🛠️ 修正：總分固定顯示為 100.0 分
             st.markdown(f"### 🎯 目前總分：{current_score:.1f} / 100.0")
 
-        # --- 執行 AI 批改邏輯 ---
         # --- 執行 AI 批改邏輯 ---
         if run_ai:
             temp_df = st.session_state.df.copy()
             num_rows = len(temp_df)
             
-            # 建立一個動態文字容器，用來顯示目前進度
             status_text = st.empty()
             
             for index, row in temp_df.iterrows():
-                # 動態更新目前正在批改的題號
                 status_text.markdown(f"⏳ **Gemini Pro 正在批改第 {index + 1} / {num_rows} 題...**")
                 
                 if row["學生作答"]:
-                    # 🛠️ 修正 Prompt：嚴格規範 Gemini 必須根據該題配分給分，這樣加總才會是符合 100 分制
                     prompt = (
                         f"你是一位專業老師。此考卷採取「總分 100 分制」，請根據以下單題資訊進行精確評分：\n"
                         f"問題：{row['問題內容']}\n"
@@ -374,9 +382,7 @@ def main():
                     except Exception as e:
                         st.warning(f"第 {index+1} 題評分錯誤: {e}")
             
-            # 批改完成後清除進度文字
             status_text.empty()
-            
             st.session_state.df = temp_df
             st.success("🎉 全數批改完成！")
             st.rerun()
