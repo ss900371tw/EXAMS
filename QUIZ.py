@@ -75,6 +75,61 @@ def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     
     return black_pixel_ratio > threshold_ratio
 
+
+def fix_ocr_text_with_llm(raw_text, openai_client):
+    """
+    OCR結果修復
+    只允許：
+    1. 修正明顯OCR錯字
+    2. 修正排版
+    3. 合併斷行
+
+    不允許：
+    1. 補充內容
+    2. 推論內容
+    3. 增加公式
+    """
+
+    if not raw_text.strip():
+        return ""
+
+    prompt = f"""
+以下是OCR結果，可能有排版錯誤。
+
+請嚴格遵守：
+
+1. 只能修正明顯OCR錯字
+2. 只能修正排版
+3. 可以合併被切斷的句子
+4. 不可以補充任何內容
+5. 不可以推測遺失內容
+6. 不可以增加不存在的文字
+7. 保留原意
+
+只輸出修正後內容：
+
+{raw_text}
+"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4.1",
+            temperature=0,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        return response.choices[0].message.content.strip()
+
+    except Exception:
+        return raw_text
+
+
+
 def detect_and_ocr_boxes(pdf_bytes, openai_client, min_w=400, min_h=100, need_debug=False):
     """
     結合 OpenCV 定位與 pdfplumber/GPT-4o 的混合文字提取。
@@ -201,7 +256,16 @@ def detect_and_ocr_boxes(pdf_bytes, openai_client, min_w=400, min_h=100, need_de
                             ],
                             temperature=0.0  # 設為 0.0 確保輸出最精確、不發散
                         )
-                        text = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+                        raw_text = (
+                            response.choices[0].message.content.strip()
+                            if response.choices[0].message.content
+                            else ""
+                        )
+
+                        text = fix_ocr_text_with_llm(
+                            raw_text,
+                            openai_client
+                        )
                     
                     except Exception as e:
                         st.warning(f"區域 GPT-4o OCR 發生錯誤: {e}")
