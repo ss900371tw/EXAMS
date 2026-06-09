@@ -88,7 +88,7 @@ def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     # 超過閾值代表中間夾有題目文字或線條，兩者不應合併
     return black_pixel_ratio > threshold_ratio
 
-def detect_and_ocr_boxes(pdf_bytes, vision_client, gemini_client, min_w=400, min_h=100, need_debug=False):
+def detect_and_ocr_boxes(pdf_bytes, gemini_client, min_w=400, min_h=100, need_debug=False):
     """
     結合 OpenCV 定位與 pdfplumber/Gemini 2.5 的混合文字提取。
     💡 增加了 gemini_client 參數，用來精準識別手寫中文字與複雜公式。
