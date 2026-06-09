@@ -129,9 +129,13 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=200, min_h=100, need_de
                 if abs(angle) < 5 or abs(angle - 180) < 5: angle = 0
                 
                 if w >= min_w and h >= min_h:
-                    box = cv2.boxPoints(((cx, cy), (w, h), angle))
-                    box = box.astype(int)
-                    candidates.append(((cx, cy), (w, h), angle, box))
+                    # --- 新增限制條件：避免框到類似「共果」等小型或偏正方形的字框 ---
+                    aspect_ratio = w / float(h)
+
+                    if aspect_ratio > 1.5: 
+                        box = cv2.boxPoints(((cx, cy), (w, h), angle))
+                        box = box.astype(int)
+                        candidates.append(((cx, cy), (w, h), angle, box))
 
             # 依 Y 軸由上到下排序
             candidates = sorted(candidates, key=lambda x: x[0][1])
