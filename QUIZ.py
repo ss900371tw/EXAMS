@@ -4,29 +4,22 @@ import numpy as np
 import cv2
 import io
 import os
-import re
 import pdfplumber
-import base64  # 💡 為了將圖片傳給 GPT-4o，需要 base64 編碼
 from PIL import Image
 from pdf2image import convert_from_bytes
-from google.cloud import vision
-from google.api_core.client_options import ClientOptions
 
-# 1. 引入最新的 Gemini GenAI SDK (負責後續結構化批改)
+# 引入最新的 Gemini GenAI SDK (負責視覺辨識與結構化批改)
 from google.genai import Client as GeminiClient
 from google.genai import types
 from pydantic import BaseModel, Field
 
-# 2. 引入 OpenAI SDK (負責精準區域 OCR)
-from openai import OpenAI
-
 # --- Define Pydantic Schema for Gemini Structured Output ---
 
 class GradingResult(BaseModel):
-    score: float = Field(description="根據標準答案與學生作答給予的得分，不可以超過該題的最高配分")
-    reason: str = Field(description="詳細的評分理由與針對學生作答的講評")
+    score: float = Field(description="根據標準答案與學生作答圖片給予的得分，不可以超過該題的最高配分")
+    reason: str = Field(description="詳細的評分理由與針對學生作答圖片的講評，若學生未作答或空白請說明")
 
-# --- 1. 核心影像處理與區域文字提取邏輯 ---
+# --- 核心影像處理與區域提取邏輯 ---
 
 def order_points_robust(pts):
     """強健的點排序：左上, 右上, 右下, 左下"""
@@ -39,26 +32,8 @@ def order_points_robust(pts):
     rect[3] = pts[np.argmax(diff)]  # bl
     return rect
 
-def enhance_for_ocr(img_np):
-    """
-    優化後的影像強化邏輯
-    """
-    if img_np is None or img_np.size == 0:
-        return None    
-    
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(gray)
-    denoised = cv2.fastNlMeansDenoising(enhanced, None, 5, 7, 21)    
-    kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
-    sharpened = cv2.filter2D(denoised, -1, kernel)
-    
-    return sharpened
-
 def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
-    """
-    針對掃描檔的盲區內容偵測
-    """
+    """針對掃描檔的盲區內容偵測"""
     h, w, _ = img_np.shape
     y_start = max(0, int(y_start))
     y_end = min(h, int(y_end))
@@ -75,70 +50,14 @@ def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     
     return black_pixel_ratio > threshold_ratio
 
-
-def fix_ocr_text_with_llm(raw_text, openai_client):
+def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=False):
     """
-    OCR結果修復
-    只允許：
-    1. 修正明顯OCR錯字
-    2. 修正排版
-    3. 合併斷行
-
-    不允許：
-    1. 補充內容
-    2. 推論內容
-    3. 增加公式
-    """
-
-    if not raw_text.strip():
-        return ""
-
-    prompt = f"""
-以下是OCR結果，可能有排版錯誤。
-
-請嚴格遵守：
-
-1. 只能修正明顯OCR錯字
-2. 只能修正排版
-3. 可以合併被切斷的句子
-4. 不可以補充任何內容
-5. 不可以推測遺失內容
-6. 不可以增加不存在的文字
-7. 保留原意
-
-只輸出修正後內容：
-
-{raw_text}
-"""
-
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4.1",
-            temperature=0,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        return response.choices[0].message.content.strip()
-
-    except Exception:
-        return raw_text
-
-
-
-def detect_and_ocr_boxes(pdf_bytes, openai_client, min_w=400, min_h=100, need_debug=False):
-    """
-    結合 OpenCV 定位與 pdfplumber/GPT-4o 的混合文字提取。
-    💡 調整為使用 openai_client 來執行無情且精準的框選 OCR。
+    結合 OpenCV 定位。
+    💡 針對文字 PDF (Q, A, P) 提取純文字；針對學生作答 (S) 則裁切並回傳 PIL.Image 物件列表。
     """
     images = convert_from_bytes(pdf_bytes, dpi=350)
-    all_text_results = []
-    debug_images = []
-
+    all_results = [] # 根據 return_images 決定放文字還是 PIL.Image
+    
     page_blocks = {} 
     page_cv_images = {} 
 
@@ -199,96 +118,38 @@ def detect_and_ocr_boxes(pdf_bytes, openai_client, min_w=400, min_h=100, need_de
                     y_max * scale_y - 3
                 )
                 
-                extracted_text = None
+                # 預設提取數位文字
+                extracted_text = ""
                 try:
                     crop = page_plumber.within_bbox(pdf_bbox)
-                    extracted_text = crop.extract_text()
+                    extracted_text = (crop.extract_text() or "").strip()
                 except Exception:
-                    extracted_text = None
+                    extracted_text = ""
 
-                # --- 🔀 核心修改：切換至 GPT-4o 執行 OCR 區塊 ---
-                if extracted_text and extracted_text.strip():
-                    text = extracted_text.strip()
-                else:
-                    rect_pts = order_points_robust(box_points)
-                    dst_pts = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype="float32")
-                    M = cv2.getPerspectiveTransform(rect_pts, dst_pts)
-                    warped = cv2.warpPerspective(img_np, M, (int(w), int(h)))
-                    
-                    pad = 10
-                    if w > pad*2 and h > pad*2:
-                        warped = warped[pad:int(h)-pad, pad:int(w)-pad]
-                    
-                    cropped_img = Image.fromarray(warped)
-
-                    try:
-                        buf = io.BytesIO()
-                        cropped_img.save(buf, format="JPEG")
-                        image_bytes = buf.getvalue()
-                        
-                        # 將圖片轉成 GPT-4o 所需的 Base64 字串
-                        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-                        
-                        # 💡 完美融入您的嚴格 OCR 規則
-                        ocr_prompt = (
-                            "請將框選出的文字精準輸出給我。嚴格遵守以下規則：\n"
-                            "1. 只輸出圖片框框中實際存在的文字，絕對不要新增任何框框中沒有出現的解釋、摘要或延伸說明。\n"
-                            "2. 不要包含任何前後引言、客套話或補充說明（例如：『以下是辨識結果』），直接輸出辨識內容即可。\n"
-                            "3. 還有不要把中文識別成英文，英文識別成中文。"
-                        )
-                        
-                        # 呼叫 GPT-4o
-                        response = openai_client.chat.completions.create(
-                            model="gpt-4o",
-                            messages=[
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "text", "text": ocr_prompt},
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {
-                                                "url": f"data:image/jpeg;base64,{base64_image}"
-                                            }
-                                        }
-                                    ]
-                                }
-                            ],
-                            temperature=0.0  # 設為 0.0 確保輸出最精確、不發散
-                        )
-                        raw_text = (
-                            response.choices[0].message.content.strip()
-                            if response.choices[0].message.content
-                            else ""
-                        )
-
-                        text = fix_ocr_text_with_llm(
-                            raw_text,
-                            openai_client
-                        )
-                    
-                    except Exception as e:
-                        st.warning(f"區域 GPT-4o OCR 發生錯誤: {e}")
-                        text = ""
-                # --- 核心 OCR 區塊修改結束 ---
+                # 如果需要回傳圖片（特別是學生作答 PDF）
+                cropped_img = None
+                rect_pts = order_points_robust(box_points)
+                dst_pts = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype="float32")
+                M = cv2.getPerspectiveTransform(rect_pts, dst_pts)
+                warped = cv2.warpPerspective(img_np, M, (int(w), int(h)))
+                
+                pad = 10
+                if w > pad*2 and h > pad*2:
+                    warped = warped[pad:int(h)-pad, pad:int(w)-pad]
+                
+                cropped_img = Image.fromarray(warped)
 
                 page_blocks[p_idx].append({
-                    "text": text,
+                    "text": extracted_text,
+                    "image": cropped_img,
                     "bbox": pdf_bbox,
                     "img_box": (x_min, y_min, x_max, y_max)
                 })
-                
-                if need_debug:
-                    cv2.drawContours(img_np, [box_points], 0, (0, 255, 0), 3)
-
-            if need_debug:
-                debug_images.append(Image.fromarray(img_np))
 
         # --- 跨頁表格合併邏輯 ---
         total_pages = len(images)
         for p_idx in range(total_pages):
             if p_idx > 0 and len(page_blocks[p_idx - 1]) > 0 and len(page_blocks[p_idx]) > 0:
-                
                 prev_page_plumber = pdf.pages[p_idx - 1]
                 curr_page_plumber = pdf.pages[p_idx]
                 
@@ -320,74 +181,80 @@ def detect_and_ocr_boxes(pdf_bytes, openai_client, min_w=400, min_h=100, need_de
                 has_image_content_between = has_scanned_content_below or has_scanned_content_above
                 
                 if (not has_digital_text_between) and (not has_image_content_between):
+                    # 合併文字
                     last_block_prev_page["text"] += "\n" + first_block_curr_page["text"]
+                    
+                    # 💡 合併圖片：垂直拼接兩張 PIL Image
+                    img1 = last_block_prev_page["image"]
+                    img2 = first_block_curr_page["image"]
+                    dst = Image.new('RGB', (max(img1.width, img2.width), img1.height + img2.height))
+                    dst.paste(img1, (0, 0))
+                    dst.paste(img2, (0, img1.height))
+                    last_block_prev_page["image"] = dst
+                    
                     first_block_curr_page["is_merged_child"] = True
 
         for p_idx in range(total_pages):
             for block in page_blocks[p_idx]:
                 if not block.get("is_merged_child", False):
-                    all_text_results.append(block["text"])
+                    if return_images:
+                        all_results.append(block["image"]) # 儲存 PIL Image
+                    else:
+                        all_results.append(block["text"])  # 儲存純文字
 
-    return all_text_results, debug_images
+    return all_results
 
-# --- 2. Streamlit UI ---
+# --- Streamlit UI ---
 
 def main():
-    st.set_page_config(page_title="AI 評分系統", layout="wide")
-    st.title("📑 全自動考卷批改工作台 (GPT-4o OCR + Gemini 2.0 批改版)")
+    st.set_page_config(page_title="AI 多模態評分系統", layout="wide")
+    st.title("📑 全自動考卷批改工作台 (Gemini 2.0 原生多模態免 OCR 版)")
 
-    if "debug_images" not in st.session_state:
-        st.session_state.debug_images = []
     if "df" not in st.session_state:
-        st.session_state.df = pd.DataFrame(columns=["題目", "問題內容", "學生作答", "標準答案", "配分", "得分", "AI 評分理由"])
+        st.session_state.df = pd.DataFrame(columns=["題目", "問題內容", "學生作答(影像物件)", "標準答案", "配分", "得分", "AI 評分理由"])
 
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # 💡 新增 OpenAI 金鑰檢查
-    
     if not GOOGLE_API_KEY:
         st.error("❌ 環境變數中找不到 GOOGLE_API_KEY，請確認 Streamlit Secrets 設定。")
         st.stop()
-        
-    if not OPENAI_API_KEY:
-        st.error("❌ 環境變數中找不到 OPENAI_API_KEY，請確認 Streamlit Secrets 設定。")
-        st.stop()
 
     try:
-        # 初始化兩個大模型 Client 
+        # 初始化 Gemini 新版 Client 
         gemini_client = GeminiClient() 
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception as e:
-        st.error(f"💥 初始化 API 失敗，請檢查環境變數與憑證：{e}")
+        st.error(f"💥 初始化 Gemini API 失敗：{e}")
         return
 
     with st.sidebar:
         st.header("📥 上傳 PDF 來源")
         pdf_q = st.file_uploader("1. 問題內容 PDF", type="pdf")
-        pdf_s = st.file_uploader("2. 學生作答 PDF", type="pdf")
+        pdf_s = st.file_uploader("2. 學生作答 PDF (支援手寫/影像)", type="pdf")
         pdf_a = st.file_uploader("3. 標準答案 PDF", type="pdf")
         pdf_p = st.file_uploader("4. 配分 PDF", type="pdf")
         
         if st.button("🚀 開始全自動解析") and pdf_q and pdf_s and pdf_a and pdf_p:
-            with st.spinner("正在執行精準座標對齊與 GPT-4o 視覺提取..."):
+            with st.spinner("正在執行結構化座標對齊與多模態區塊裁切..."):
                 q_bytes = pdf_q.read()
                 s_bytes = pdf_s.read()
                 a_bytes = pdf_a.read()
                 p_bytes = pdf_p.read()
 
-                # 💡 將 openai_client 傳入解析函式
-                q_texts, _ = detect_and_ocr_boxes(q_bytes, openai_client)
-                s_texts, s_debug_imgs = detect_and_ocr_boxes(s_bytes, openai_client, need_debug=True)
-                a_texts, _ = detect_and_ocr_boxes(a_bytes, openai_client)
-                p_texts, _ = detect_and_ocr_boxes(p_bytes, openai_client)
+                # 問題、答案、配分提取文字
+                q_texts = detect_and_extract_blocks(q_bytes, return_images=False)
+                a_texts = detect_and_extract_blocks(a_bytes, return_images=False)
+                p_texts = detect_and_extract_blocks(p_bytes, return_images=False)
                 
-                num_questions = max(len(q_texts), len(s_texts), len(a_texts), len(p_texts))
+                # 💡 學生作答直接提取「影像物件列表」
+                s_images = detect_and_extract_blocks(s_bytes, return_images=True)
+                
+                num_questions = max(len(q_texts), len(s_images), len(a_texts), len(p_texts))
                 
                 data = []
                 for i in range(num_questions):
                     data.append({
                         "題目": f"第 {i+1} 題",
                         "問題內容": q_texts[i] if i < len(q_texts) else "",
-                        "學生作答": s_texts[i] if i < len(s_texts) else "",
+                        "學生作答(影像物件)": s_images[i] if i < len(s_images) else None, # 儲存 PIL.Image
                         "標準答案": a_texts[i] if i < len(a_texts) else "",
                         "配分": p_texts[i] if i < len(p_texts) else "10",
                         "得分": 0.0,
@@ -395,25 +262,32 @@ def main():
                     })
                 
                 st.session_state.df = pd.DataFrame(data)
-                st.session_state.debug_images = s_debug_imgs
-                st.success(f"解析完成！共處理 {num_questions} 個題目區塊。")
+                st.success(f"解析完成！共對齊 {num_questions} 個多模態區塊。")
 
-    col1, col2 = st.columns([3, 2])
+    col1, col2 = st.columns([7, 5])
+    
     with col1:
         st.subheader("📝 結構化評分表")
         
-        if "main_editor" not in st.session_state:
-            st.session_state.main_editor = {"edited_rows": {}, "added_rows": [], "deleted_rows": []}
+        # 💡 為了在 data_editor 隱藏無法渲染的 PIL.Image 欄位，我們建立一個顯示用的副本
+        display_df = st.session_state.df.copy()
+        # 將 Image 物件轉為可讀字串供表格顯示
+        display_df["學生作答(影像物件)"] = display_df["學生作答(影像物件)"].apply(lambda x: "📷 影像已就緒 (點擊右側觀看)" if x is not None else "⚠️ 無影像")
 
-        edited_df = st.data_editor(
-            st.session_state.df,
+        edited_display_df = st.data_editor(
+            display_df,
             num_rows="dynamic",
             use_container_width=True,
-            height=600,
+            height=500,
             key="my_data_editor"
         )
         
-        st.session_state.df = edited_df
+        # 將使用者在表格中修改的「得分」與「理由」同步回 session_state.df
+        st.session_state.df["得分"] = edited_display_df["得分"]
+        st.session_state.df["AI 評分理由"] = edited_display_df["AI 評分理由"]
+        st.session_state.df["問題內容"] = edited_display_df["問題內容"]
+        st.session_state.df["標準答案"] = edited_display_df["標準答案"]
+        st.session_state.df["配分"] = edited_display_df["配分"]
 
         try:
             current_score = pd.to_numeric(st.session_state.df["得分"]).sum()
@@ -421,41 +295,45 @@ def main():
             current_score = 0
 
         btn_col, score_col = st.columns([1, 1])
-
         with btn_col:
-            run_ai = st.button("🤖 執行 Gemini 自動批改", use_container_width=True)
-        
+            run_ai = st.button("🤖 執行 Gemini 多模態自動批改", use_container_width=True)
         with score_col:
             st.markdown(f"### 🎯 目前總分：{current_score:.1f} / 100.0")
 
-        # --- 執行 AI 批改邏輯 ---
+        # --- 執行 多模態 AI 批改邏輯 ---
         if run_ai:
             temp_df = st.session_state.df.copy()
             num_rows = len(temp_df)
-            
             status_text = st.empty()
             
             for index, row in temp_df.iterrows():
-                status_text.markdown(f"⏳ **Gemini Pro 正在批改第 {index + 1} / {num_rows} 題...**")
+                status_text.markdown(f"⏳ **Gemini 正在視覺辨識並批改第 {index + 1} / {num_rows} 題...**")
                 
-                if row["學生作答"]:
+                student_img = row["學生作答(影像物件)"]
+                
+                if student_img is not None:
+                    # 💡 Prompt 全面翻新，指示 Gemini 同時閱讀文字與圖片
                     prompt = (
-                        f"你是一位專業老師。此考卷採取「總分 100 分制」，請根據以下單題資訊進行精確評分：\n"
-                        f"問題：{row['問題內容']}\n"
+                        f"你是一位專業且嚴謹的審查老師。此考卷採取「總分 100 分制」，請根據給予的題目資訊與附加的學生作答圖片進行精確評分：\n\n"
+                        f"【單題題目資訊】\n"
+                        f"問題內容：{row['問題內容']}\n"
                         f"標準答案：{row['標準答案']}\n"
-                        f"學生回答：{row['學生作答']}\n"
-                        f"【重要】此題的最高配分（滿分）為：{row['配分']} 分。\n"
-                        f"請評估學生的回答完整度與正確性，給予 0 到 {row['配分']} 之間的合理分數（可為小數）。\n"
-                        f"你給出的分數「絕對不可以」超過該題的最高配分。\n"
+                        f"最高配分（滿分）：{row['配分']} 分。\n\n"
+                        f"【批改任務說明】\n"
+                        f"1. 請仔細審視附加的圖片，圖片內包含學生針對該題的手寫答案、算式、圖表或打字內容。\n"
+                        f"2. 評估學生回答的正確性、邏輯完整度，並對照標準答案，給予 0 到 {row['配分']} 之間的合理分數（可給予小數點後一分，如 8.5）。\n"
+                        f"3. 評分理由請詳細列出：學生答對了什麼、漏掉了什麼關鍵字，或是圖片中的推導錯在哪裡。\n"
+                        f"4. 嚴重警告：你給出的分數「絕對不可以」超過該題的最高配分。\n"
                     )
                     try:
+                        # 💡 核心多模態傳參：直接將 prompt 文字與 PIL.Image 放入 contents 陣列
                         response = gemini_client.models.generate_content(
                             model='gemini-2.0-pro-exp-0205',  
-                            contents=prompt,
+                            contents=[prompt, student_img],
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
                                 response_schema=GradingResult,
-                                temperature=0.2, 
+                                temperature=0.1, 
                             ),
                         )
                         
@@ -464,20 +342,43 @@ def main():
                         temp_df.at[index, "AI 評分理由"] = result.reason
                         
                     except Exception as e:
-                        st.warning(f"第 {index+1} 題評分錯誤: {e}")
+                        st.warning(f"第 {index+1} 題多模態評分發生錯誤: {e}")
+                else:
+                    temp_df.at[index, "得分"] = 0.0
+                    temp_df.at[index, "AI 評分理由"] = "未偵測到學生作答圖片，以 0 分計算。"
             
             status_text.empty()
             st.session_state.df = temp_df
-            st.success("🎉 全數批改完成！")
+            st.success("🎉 全數多模態批改完成！")
             st.rerun()
             
     with col2:
-        st.subheader("🔍 框選對齊視覺檢查")
-        if st.session_state.debug_images:
-            for i, img in enumerate(st.session_state.debug_images):
-                st.image(img, caption=f"偵測區域預覽 - 頁面 {i+1}")
+        st.subheader("🔍 盲區視覺複核面板")
+        st.info("💡 提示：在左側表格中點選任意儲存格，下方即可同步切換顯示該題學生的原始作答區塊圖片。")
+        
+        # 利用 data_editor 的內建選取項，找出使用者目前點擊的是第幾列
+        if "my_data_editor" in st.session_state and st.session_state.my_data_editor.get("selection"):
+            selected_rows = st.session_state.my_data_editor["selection"]["rows"]
+            if selected_rows:
+                selected_idx = selected_rows[0]
+                if selected_idx < len(st.session_state.df):
+                    row_data = st.session_state.df.iloc[selected_idx]
+                    st.markdown(f"#### 📋 當前檢視：**{row_data['題目']}**")
+                    st.markdown(f"**問題：** {row_data['問題內容']}")
+                    st.markdown(f"**標準答案：** {row_data['標準答案']}")
+                    
+                    img_obj = row_data["學生作答(影像物件)"]
+                    if img_obj is not None:
+                        st.image(img_obj, use_container_width=True, caption=f"學生作答的原始裁切盲區影像")
+                    else:
+                        st.warning("該題無對應的學生作答影像")
         else:
-            st.info("暫無視覺檢查影像，請先上傳 PDF 並點擊開始全自動解析。")
+            # 預設把第一題拿出來秀
+            if len(st.session_state.df) > 0:
+                first_row = st.session_state.df.iloc[0]
+                st.markdown(f"#### 📋 預覽第一題：**{first_row['題目']}**")
+                if first_row["學生作答(影像物件)"] is not None:
+                    st.image(first_row["學生作答(影像物件)"], use_container_width=True)
 
 if __name__ == "__main__":
     main()
