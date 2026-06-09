@@ -165,6 +165,8 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_de
                 except Exception:
                     extracted_text = None
 
+                # 修改 detect_and_ocr_boxes 函式內，原本處理 OCR 的區塊：
+
                 if extracted_text and extracted_text.strip():
                     text = extracted_text.strip()
                 else:
@@ -176,23 +178,35 @@ def detect_and_ocr_boxes(pdf_bytes, vision_client, min_w=400, min_h=100, need_de
                     pad = 10
                     if w > pad*2 and h > pad*2:
                         warped = warped[pad:int(h)-pad, pad:int(w)-pad]
-                    warped_enhanced = enhance_for_ocr(warped)
-                    cropped_img = Image.fromarray(warped_enhanced)
-
-                    buf = io.BytesIO()
-                    cropped_img.save(buf, format="JPEG")
                     
-                    # 💡 【核心優化】精準設定語言提示
-                    # 將 zh-Hant 設為最主要提示，強制系統使用支援亞洲雙語混雜的 OCR 模型
-                    image_context = vision.ImageContext(language_hints=["zh-Hant", "zh", "en"])
-                    vision_img = vision.Image(content=buf.getvalue())
+                    # 💡 優化點 1：傳給 Gemini 的影像不需要做 enhance_for_ocr，保留最真實的手寫灰階或色彩
+                    cropped_img = Image.fromarray(warped)
 
-                    # 使用 document_text_detection 處理密集/混雜段落文字
-                    response = vision_client.document_text_detection(
-                        image=vision_img, 
-                        image_context=image_context
-                    )
-                    text = response.full_text_annotation.text.strip() if response.full_text_annotation.text else ""
+                    # 💡 優化點 2：直接利用現有的 gemini_client 進行多模態辨識
+                    try:
+                        # 將裁剪下來的區塊轉成 Gemini 接受的 bytes 格式
+                        buf = io.BytesIO()
+                        cropped_img.save(buf, format="JPEG")
+                        image_bytes = buf.getvalue()
+                        
+                        ocr_prompt = (
+                            "請精確辨識這張圖片中的所有文字，包含公式與手寫字。\n"
+                            "必須特別注意手寫繁體中文的辨識，不要遺漏任何字，並依照閱讀順序輸出。\n"
+                            "如果是公式，請盡量用清晰的文字或數學符號呈現。"
+                        )
+                        
+                        gemini_ocr_response = gemini_client.models.generate_content(
+                            model='gemini-2.5-flash', # OCR 任務用 flash 速度快且成本低，效果就極好
+                            contents=[
+                                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                                ocr_prompt
+                            ]
+                        )
+                        text = gemini_ocr_response.text.strip() if gemini_ocr_response.text else ""
+                    
+                    except Exception as e:
+                        st.warning(f"區域 Gemini OCR 發生錯誤: {e}")
+                        text = ""
 
                 page_blocks[p_idx].append({
                     "text": text,
