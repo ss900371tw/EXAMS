@@ -51,12 +51,8 @@ def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     return black_pixel_ratio > threshold_ratio
 
 def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=False):
-    """
-    結合 OpenCV 定位。
-    💡 針對文字 PDF (Q, A, P) 提取純文字；針對學生作答 (S) 則裁切並回傳 PIL.Image 物件列表。
-    """
     images = convert_from_bytes(pdf_bytes, dpi=350)
-    all_results = [] # 根據 return_images 決定放文字還是 PIL.Image
+    all_results = []
     
     page_blocks = {} 
     page_cv_images = {} 
@@ -74,6 +70,22 @@ def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=Fal
             scale_y = h_pdf / h_img
 
             gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            
+            # =======================================================
+            # 🌟 新增：消除頁碼與頁首干擾 (ROI 遮罩)
+            # 這裡假設 DPI=350 時，頂部 150 像素和底部 200 像素是頁首與頁碼區
+            # 實際像素調整可以根據你的考卷格式測試
+            # =======================================================
+            ignore_top_px = 150   # 忽略頂部高度
+            ignore_bottom_px = 200 # 忽略底部高度 (頁碼通常在這裡)
+            
+            # 將灰階圖的頁首、頁尾區域強行塗白 (255)，不讓它們參與後續的二值化與線條偵測
+            if ignore_top_px > 0:
+                gray[0:ignore_top_px, :] = 255
+            if ignore_bottom_px > 0:
+                gray[h_img - ignore_bottom_px:h_img, :] = 255
+            # =======================================================
+
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
             binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                            cv2.THRESH_BINARY_INV, 21, 18)
