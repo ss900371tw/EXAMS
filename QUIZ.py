@@ -50,190 +50,343 @@ def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     
     return black_pixel_ratio > threshold_ratio
 
-def detect_and_extract_blocks(pdf_bytes, min_w=300, min_h=80, return_images=False):
+def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=False):
+
     """
+
     結合 OpenCV 定位。
+
     💡 針對文字 PDF (Q, A, P) 提取純文字；針對學生作答 (S) 則裁切並回傳 PIL.Image 物件列表。
-    ✨ 已修復：穿透表格外框，精準偵測每個獨立單元格 (Cell)。
+
+    ✨ 已加入「頁首/頁碼動態消除遮罩」，防止跨頁框架斷裂。
+
     """
+
     images = convert_from_bytes(pdf_bytes, dpi=350)
+
     all_results = [] 
+
     
+
     page_blocks = {} 
+
     page_cv_images = {} 
 
+
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+
         for p_idx, img in enumerate(images):
+
             img_np = np.array(img.convert("RGB"))
+
             page_cv_images[p_idx] = img_np.copy()
+
             h_img, w_img, _ = img_np.shape
+
             
+
             page_plumber = pdf.pages[p_idx]
+
             w_pdf, h_pdf = page_plumber.width, page_plumber.height
+
             
+
             scale_x = w_pdf / w_img
+
             scale_y = h_pdf / h_img
+
+
 
             gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
+
+
             # =======================================================
-            # 消除頁首、頁尾與頁碼干擾 (ROI 遮罩)
+
+            # 🌟 新增核心邏輯：消除頁首、頁尾與頁碼干擾 (ROI 遮罩)
+
+            # 在 DPI=350 下，頂部約 140 像素，底部約 180 像素通常為頁首頁尾。
+
+            # 這裡直接在灰階圖上強行填白 (255)，使其不參與線條與輪廓偵測。
+
             # =======================================================
+
             ignore_top_px = 140      # 忽略頁首高度
+
             ignore_bottom_px = 180   # 忽略頁尾與頁碼高度
+
             
+
             if ignore_top_px > 0:
+
                 gray[0:ignore_top_px, :] = 255
+
             if ignore_bottom_px > 0:
+
                 gray[h_img - ignore_bottom_px:h_img, :] = 255
 
+            # =======================================================
+
+
+
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
             binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+
                                            cv2.THRESH_BINARY_INV, 21, 18)
 
-            # =======================================================
-            # 💡 修改 1：調整形態學核尺寸，避免將小單元格線條蝕刻掉
-            # =======================================================
-            h_k = 30  # 適中尺寸，避免過長直接把小欄位融合成一個大框
-            v_k = 20
+
+
+            h_k = max(60, int(min_w * 0.5)) 
+
+            v_k = max(30, int(min_h * 0.6))
+
             horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_k, 1))
+
             vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_k))
+
             
+
             detected_h = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+
             detected_v = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+
             detected_lines = cv2.add(detected_h, detected_v)
 
-            # =======================================================
-            # 💡 修改 2：改用 RETR_TREE 提取包含內層單元格在內的所有輪廓及其層級結構
-            # =======================================================
-            contours, hierarchy = cv2.findContours(detected_lines, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+
+            contours, _ = cv2.findContours(detected_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
             
+
             candidates = []
-            if contours and hierarchy is not None:
-                hierarchy = hierarchy[0]  # [Next, Previous, First_Child, Parent]
+
+            for cnt in contours:
+
+                rect = cv2.minAreaRect(cnt)
+
+                (cx, cy), (w, h), angle = rect
+
+                if w < h:
+
+                    w, h = h, w
+
+                    angle += 90
+
                 
-                for i, cnt in enumerate(contours):
-                    # 1. 忽略過大的外包框 (如佔據頁面 35% 以上的表格外框)
-                    area = cv2.contourArea(cnt)
-                    if area > (w_img * h_img * 0.35):
-                        continue
-                    
-                    # 2. 忽略包含「子輪廓」的母輪廓 (即表格的外大框，只保留最裡面的單元格)
-                    # hierarchy[i][2] != -1 代表有 First_Child
-                    if hierarchy[i][2] != -1:
-                        continue
 
-                    rect = cv2.minAreaRect(cnt)
-                    (cx, cy), (w, h), angle = rect
-                    if w < h:
-                        w, h = h, w
-                        angle += 90
-                    
-                    if abs(angle) < 5 or abs(angle - 180) < 5: 
-                        angle = 0
-                    
-                    # 檢查是否符合最小作答框尺寸條件
-                    if w >= min_w and h >= min_h:
-                        box = cv2.boxPoints(((cx, cy), (w, h), angle))
-                        box = box.astype(int)
-                        candidates.append(((cx, cy), (w, h), angle, box))
+                if abs(angle) < 5 or abs(angle - 180) < 5: angle = 0
 
-            # 按縱向座標 Y (由上到下) 排序
+                
+
+                if w >= min_w and h >= min_h:
+
+                    box = cv2.boxPoints(((cx, cy), (w, h), angle))
+
+                    box = box.astype(int)
+
+                    candidates.append(((cx, cy), (w, h), angle, box))
+
+
+
             candidates = sorted(candidates, key=lambda x: x[0][1])
+
             page_blocks[p_idx] = []
 
+
+
             for (cx, cy), (w, h), angle, box_points in candidates:
+
                 x_min, y_min = np.min(box_points, axis=0)
+
                 x_max, y_max = np.max(box_points, axis=0)
+
                 
+
                 pdf_bbox = (
+
                     x_min * scale_x + 3, 
+
                     y_min * scale_y + 3, 
+
                     x_max * scale_x - 3, 
+
                     y_max * scale_y - 3
+
                 )
+
                 
+
                 # 預設提取數位文字
+
                 extracted_text = ""
+
                 try:
+
                     crop = page_plumber.within_bbox(pdf_bbox)
+
                     extracted_text = (crop.extract_text() or "").strip()
+
                 except Exception:
+
                     extracted_text = ""
 
+
+
                 # 如果需要回傳圖片（特別是學生作答 PDF）
+
                 cropped_img = None
+
                 rect_pts = order_points_robust(box_points)
+
                 dst_pts = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype="float32")
+
                 M = cv2.getPerspectiveTransform(rect_pts, dst_pts)
+
                 warped = cv2.warpPerspective(img_np, M, (int(w), int(h)))
+
                 
+
                 pad = 10
+
                 if w > pad*2 and h > pad*2:
+
                     warped = warped[pad:int(h)-pad, pad:int(w)-pad]
+
                 
+
                 cropped_img = Image.fromarray(warped)
 
+
+
                 page_blocks[p_idx].append({
+
                     "text": extracted_text,
+
                     "image": cropped_img,
+
                     "bbox": pdf_bbox,
+
                     "img_box": (x_min, y_min, x_max, y_max)
+
                 })
 
+
+
         # --- 跨頁表格合併邏輯 ---
+
         total_pages = len(images)
-        for p_idx in range(total_pages):
-            if p_idx > 0 and len(page_blocks[p_idx - 1]) > 0 and len(page_blocks[p_idx]) > 0:
-                prev_page_plumber = pdf.pages[p_idx - 1]
-                curr_page_plumber = pdf.pages[p_idx]
-                
-                last_block_prev_page = page_blocks[p_idx - 1][-1]
-                first_block_curr_page = page_blocks[p_idx][0]
-                
-                text_below_last_table = ""
-                text_above_first_table = ""
-                try:
-                    bottom_crop = prev_page_plumber.crop((0, last_block_prev_page["bbox"][3], prev_page_plumber.width, prev_page_plumber.height))
-                    text_below_last_table = bottom_crop.extract_text() or ""
-                    
-                    top_crop = curr_page_plumber.crop((0, 0, curr_page_plumber.width, first_block_curr_page["bbox"][0]))
-                    text_above_first_table = top_crop.extract_text() or ""
-                except Exception:
-                    pass
-                
-                has_digital_text_between = bool(text_below_last_table.strip() or text_above_first_table.strip())
-                
-                prev_img_np = page_cv_images[p_idx - 1]
-                curr_img_np = page_cv_images[p_idx]
-                
-                _, _, _, last_y_max = last_block_prev_page["img_box"]
-                _, first_y_min, _, _ = first_block_curr_page["img_box"]
-                
-                has_scanned_content_below = has_visible_content_in_crop(prev_img_np, last_y_max, prev_img_np.shape[0] - ignore_bottom_px)
-                has_scanned_content_above = has_visible_content_in_crop(curr_img_np, ignore_top_px, first_y_min)
-                
-                has_image_content_between = has_scanned_content_below or has_scanned_content_above
-                
-                if (not has_digital_text_between) and (not has_image_content_between):
-                    last_block_prev_page["text"] += "\n" + first_block_curr_page["text"]
-                    
-                    img1 = last_block_prev_page["image"]
-                    img2 = first_block_curr_page["image"]
-                    dst = Image.new('RGB', (max(img1.width, img2.width), img1.height + img2.height))
-                    dst.paste(img1, (0, 0))
-                    dst.paste(img2, (0, img1.height))
-                    last_block_prev_page["image"] = dst
-                    
-                    first_block_curr_page["is_merged_child"] = True
 
         for p_idx in range(total_pages):
+
+            if p_idx > 0 and len(page_blocks[p_idx - 1]) > 0 and len(page_blocks[p_idx]) > 0:
+
+                prev_page_plumber = pdf.pages[p_idx - 1]
+
+                curr_page_plumber = pdf.pages[p_idx]
+
+                
+
+                last_block_prev_page = page_blocks[p_idx - 1][-1]
+
+                first_block_curr_page = page_blocks[p_idx][0]
+
+                
+
+                text_below_last_table = ""
+
+                text_above_first_table = ""
+
+                try:
+
+                    bottom_crop = prev_page_plumber.crop((0, last_block_prev_page["bbox"][3], prev_page_plumber.width, prev_page_plumber.height))
+
+                    text_below_last_table = bottom_crop.extract_text() or ""
+
+                    
+
+                    top_crop = curr_page_plumber.crop((0, 0, curr_page_plumber.width, first_block_curr_page["bbox"][0]))
+
+                    text_above_first_table = top_crop.extract_text() or ""
+
+                except Exception:
+
+                    pass
+
+                
+
+                # 這裡調低盲區判斷比重，因為頁碼已被塗白
+
+                has_digital_text_between = bool(text_below_last_table.strip() or text_above_first_table.strip())
+
+                
+
+                prev_img_np = page_cv_images[p_idx - 1]
+
+                curr_img_np = page_cv_images[p_idx]
+
+                
+
+                _, _, _, last_y_max = last_block_prev_page["img_box"]
+
+                _, first_y_min, _, _ = first_block_curr_page["img_box"]
+
+                
+
+                has_scanned_content_below = has_visible_content_in_crop(prev_img_np, last_y_max, prev_img_np.shape[0] - ignore_bottom_px)
+
+                has_scanned_content_above = has_visible_content_in_crop(curr_img_np, ignore_top_px, first_y_min)
+
+                
+
+                has_image_content_between = has_scanned_content_below or has_scanned_content_above
+
+                
+
+                if (not has_digital_text_between) and (not has_image_content_between):
+
+                    # 合併文字
+
+                    last_block_prev_page["text"] += "\n" + first_block_curr_page["text"]
+
+                    
+
+                    # 合併圖片：垂直拼接兩張 PIL Image
+
+                    img1 = last_block_prev_page["image"]
+
+                    img2 = first_block_curr_page["image"]
+
+                    dst = Image.new('RGB', (max(img1.width, img2.width), img1.height + img2.height))
+
+                    dst.paste(img1, (0, 0))
+
+                    dst.paste(img2, (0, img1.height))
+
+                    last_block_prev_page["image"] = dst
+
+                    
+
+                    first_block_curr_page["is_merged_child"] = True
+
+
+
+        for p_idx in range(total_pages):
+
             for block in page_blocks[p_idx]:
+
                 if not block.get("is_merged_child", False):
+
                     if return_images:
+
                         all_results.append(block["image"]) 
+
                     else:
+
                         all_results.append(block["text"])  
+
+
 
     return all_results
 
