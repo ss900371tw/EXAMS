@@ -50,11 +50,11 @@ def has_visible_content_in_crop(img_np, y_start, y_end, threshold_ratio=0.005):
     
     return black_pixel_ratio > threshold_ratio
 
-def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=False):
+def detect_and_extract_blocks(pdf_bytes, min_w=300, min_h=80, return_images=False):
     """
     結合 OpenCV 定位。
     💡 針對文字 PDF (Q, A, P) 提取純文字；針對學生作答 (S) 則裁切並回傳 PIL.Image 物件列表。
-    ✨ 已加入「頁首/頁碼動態消除遮罩」，防止跨頁框架斷裂。
+    ✨ 已修復：穿透表格外框，精準偵測每個獨立單元格 (Cell)。
     """
     images = convert_from_bytes(pdf_bytes, dpi=350)
     all_results = [] 
@@ -77,9 +77,7 @@ def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=Fal
             gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
             # =======================================================
-            # 🌟 新增核心邏輯：消除頁首、頁尾與頁碼干擾 (ROI 遮罩)
-            # 在 DPI=350 下，頂部約 140 像素，底部約 180 像素通常為頁首頁尾。
-            # 這裡直接在灰階圖上強行填白 (255)，使其不參與線條與輪廓偵測。
+            # 消除頁首、頁尾與頁碼干擾 (ROI 遮罩)
             # =======================================================
             ignore_top_px = 140      # 忽略頁首高度
             ignore_bottom_px = 180   # 忽略頁尾與頁碼高度
@@ -88,14 +86,16 @@ def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=Fal
                 gray[0:ignore_top_px, :] = 255
             if ignore_bottom_px > 0:
                 gray[h_img - ignore_bottom_px:h_img, :] = 255
-            # =======================================================
 
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
             binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                            cv2.THRESH_BINARY_INV, 21, 18)
 
-            h_k = max(60, int(min_w * 0.5)) 
-            v_k = max(30, int(min_h * 0.6))
+            # =======================================================
+            # 💡 修改 1：調整形態學核尺寸，避免將小單元格線條蝕刻掉
+            # =======================================================
+            h_k = 30  # 適中尺寸，避免過長直接把小欄位融合成一個大框
+            v_k = 20
             horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_k, 1))
             vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_k))
             
@@ -103,23 +103,42 @@ def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=Fal
             detected_v = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
             detected_lines = cv2.add(detected_h, detected_v)
 
-            contours, _ = cv2.findContours(detected_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # =======================================================
+            # 💡 修改 2：改用 RETR_TREE 提取包含內層單元格在內的所有輪廓及其層級結構
+            # =======================================================
+            contours, hierarchy = cv2.findContours(detected_lines, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             
             candidates = []
-            for cnt in contours:
-                rect = cv2.minAreaRect(cnt)
-                (cx, cy), (w, h), angle = rect
-                if w < h:
-                    w, h = h, w
-                    angle += 90
+            if contours and hierarchy is not None:
+                hierarchy = hierarchy[0]  # [Next, Previous, First_Child, Parent]
                 
-                if abs(angle) < 5 or abs(angle - 180) < 5: angle = 0
-                
-                if w >= min_w and h >= min_h:
-                    box = cv2.boxPoints(((cx, cy), (w, h), angle))
-                    box = box.astype(int)
-                    candidates.append(((cx, cy), (w, h), angle, box))
+                for i, cnt in enumerate(contours):
+                    # 1. 忽略過大的外包框 (如佔據頁面 35% 以上的表格外框)
+                    area = cv2.contourArea(cnt)
+                    if area > (w_img * h_img * 0.35):
+                        continue
+                    
+                    # 2. 忽略包含「子輪廓」的母輪廓 (即表格的外大框，只保留最裡面的單元格)
+                    # hierarchy[i][2] != -1 代表有 First_Child
+                    if hierarchy[i][2] != -1:
+                        continue
 
+                    rect = cv2.minAreaRect(cnt)
+                    (cx, cy), (w, h), angle = rect
+                    if w < h:
+                        w, h = h, w
+                        angle += 90
+                    
+                    if abs(angle) < 5 or abs(angle - 180) < 5: 
+                        angle = 0
+                    
+                    # 檢查是否符合最小作答框尺寸條件
+                    if w >= min_w and h >= min_h:
+                        box = cv2.boxPoints(((cx, cy), (w, h), angle))
+                        box = box.astype(int)
+                        candidates.append(((cx, cy), (w, h), angle, box))
+
+            # 按縱向座標 Y (由上到下) 排序
             candidates = sorted(candidates, key=lambda x: x[0][1])
             page_blocks[p_idx] = []
 
@@ -183,7 +202,6 @@ def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=Fal
                 except Exception:
                     pass
                 
-                # 這裡調低盲區判斷比重，因為頁碼已被塗白
                 has_digital_text_between = bool(text_below_last_table.strip() or text_above_first_table.strip())
                 
                 prev_img_np = page_cv_images[p_idx - 1]
@@ -198,10 +216,8 @@ def detect_and_extract_blocks(pdf_bytes, min_w=400, min_h=100, return_images=Fal
                 has_image_content_between = has_scanned_content_below or has_scanned_content_above
                 
                 if (not has_digital_text_between) and (not has_image_content_between):
-                    # 合併文字
                     last_block_prev_page["text"] += "\n" + first_block_curr_page["text"]
                     
-                    # 合併圖片：垂直拼接兩張 PIL Image
                     img1 = last_block_prev_page["image"]
                     img2 = first_block_curr_page["image"]
                     dst = Image.new('RGB', (max(img1.width, img2.width), img1.height + img2.height))
